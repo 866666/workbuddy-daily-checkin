@@ -1,0 +1,4 @@
+requests>=2.31
+websocket-client>=1.6
+psutil>=5.9
+pywin32>=306; sys_platform == "win32"
