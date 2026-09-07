@@ -1,0 +1,21 @@
+# 运行时产物
+logs/
+__pycache__/
+*.pyc
+*.pyo
+
+# 个人配置（含账号显示名，勿入库）
+config.json
+
+# 诊断/调试
+diag/
+*.png
+*.log
+*.pid
+
+# 编辑器/系统
+.workbuddy/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
