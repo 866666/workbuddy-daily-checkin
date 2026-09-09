@@ -44,7 +44,7 @@ def find_pythonw():
     raise SystemExit("找不到 pythonw.exe，请用完整 Python 安装目录下的解释器运行本脚本")
 
 
-def register_via_com(task_name, at, pythonw, script):
+def register_via_com(task_name, at, pythonw, script, extra_args=""):
     """pywin32 COM 注册：支持电池供电 + StartWhenAvailable（错过补跑）"""
     import win32com.client
     sched = win32com.client.Dispatch("Schedule.Service")
@@ -62,7 +62,7 @@ def register_via_com(task_name, at, pythonw, script):
 
     action = td.Actions.Create(0)  # TASK_ACTION_EXEC
     action.Path = pythonw
-    action.Arguments = f'"{script}"'
+    action.Arguments = f'"{script}" {extra_args}'.strip()
 
     s = td.Settings
     s.DisallowStartIfOnBatteries = False   # 电池供电也运行
@@ -70,16 +70,16 @@ def register_via_com(task_name, at, pythonw, script):
     s.StartWhenAvailable = True            # 错过（睡眠/关机）后开机补跑
     s.WakeToRun = False
     s.ExecutionTimeLimit = "PT4H"
-    s.MultipleInstances = 0                # IgnoreNew
+    s.MultipleInstances = 2                # TASK_INSTANCES_IGNORE_NEW（0=Parallel, 2=IgnoreNew）
 
     folder.RegisterTaskDefinition(task_name, td, 6, None, None, 3)  # 6=CREATE_OR_UPDATE
     print(f"✅ 任务已注册（COM）：{task_name}，每天 {at}，pythonw 静默运行")
 
 
-def register_via_schtasks(task_name, at, pythonw, script):
+def register_via_schtasks(task_name, at, pythonw, script, extra_args=""):
     """schtasks 兜底：仅基础每日触发"""
     cmd = ["schtasks", "/Create", "/TN", task_name, "/TR",
-           f'"{pythonw}" "{script}"', "/SC", "DAILY", "/ST", at, "/F"]
+           f'"{pythonw}" "{script}" {extra_args}'.strip(), "/SC", "DAILY", "/ST", at, "/F"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode == 0:
         print(f"✅ 任务已注册（schtasks）：{task_name}，每天 {at}")
@@ -111,10 +111,11 @@ def delete_task(task_name):
         print("❌ 删除失败：", r.stderr or r.stdout)
 
 
-def register(task_name=DEFAULT_NAME, at="07:00", script=None, pythonw=None):
+def register(task_name=DEFAULT_NAME, at="07:00", script=None, pythonw=None, extra_args=""):
     """注册每日自动签到任务（可被 checkin_cdp.py --setup 调用）
 
     script 默认取本文件同目录的 checkin_cdp.py；pythonw 默认自动定位。
+    extra_args 为附加到脚本后的命令行参数（如 --no-auto-launch）。
     """
     pythonw = pythonw or find_pythonw()
     script = script or str(Path(__file__).parent / "checkin_cdp.py")
@@ -123,14 +124,16 @@ def register(task_name=DEFAULT_NAME, at="07:00", script=None, pythonw=None):
 
     print(f"pythonw: {pythonw}")
     print(f"script : {script}")
+    if extra_args:
+        print(f"args   : {extra_args}")
 
     try:
-        register_via_com(task_name, at, pythonw, script)
+        register_via_com(task_name, at, pythonw, script, extra_args)
     except ImportError:
-        register_via_schtasks(task_name, at, pythonw, script)
+        register_via_schtasks(task_name, at, pythonw, script, extra_args)
     except Exception as e:
         print(f"⚠️ COM 注册失败（{e}），尝试 schtasks 兜底...")
-        register_via_schtasks(task_name, at, pythonw, script)
+        register_via_schtasks(task_name, at, pythonw, script, extra_args)
     return True
 
 
@@ -140,6 +143,8 @@ if __name__ == "__main__":
     ap.add_argument("--at", default="07:00", help="每天运行时间 HH:MM")
     ap.add_argument("--script", default=None,
                     help="checkin_cdp.py 路径（默认本文件同目录）")
+    ap.add_argument("--extra-args", default="",
+                    help="附加到脚本后的命令行参数（如 --no-auto-launch）")
     ap.add_argument("--delete", action="store_true", help="删除已注册任务")
     args = ap.parse_args()
 
@@ -147,4 +152,5 @@ if __name__ == "__main__":
         delete_task(args.task_name)
         sys.exit(0)
 
-    register(task_name=args.task_name, at=args.at, script=args.script)
+    register(task_name=args.task_name, at=args.at, script=args.script,
+             extra_args=args.extra_args)

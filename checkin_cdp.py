@@ -13,10 +13,10 @@
 
 **日常签到（计划任务自动调用，也可手动）：**
 
-    python checkin_cdp.py                # 正常签到；连不上调试服务会自动拉起 WorkBuddy
+    python checkin_cdp.py                # 正常签到；auto_launch=true 时连不上才会自动拉起
     python checkin_cdp.py --dry          # 只检测按钮，不点击
     python checkin_cdp.py --info         # 打印端口与页面列表
-    python checkin_cdp.py --no-auto-launch   # 关闭"自动拉起目标应用"，连不上就直接报错
+    python checkin_cdp.py --no-auto-launch   # 强制禁用"自动拉起目标应用"，连不上就直接报错
 
 原理
 ----
@@ -62,6 +62,10 @@ DEFAULT_CONFIG = {
     "skip_ports": [],
     # WorkBuddy 可执行文件路径；留空/auto 时自动定位（App Paths → Program Files → PATH）
     "workbuddy_exe": "auto",
+    # 连不上调试服务时是否自动拉起/重启 WorkBuddy。
+    # 注意：WorkBuddy 已带调试端口常驻运行（如本机日常使用场景）建议设为 false，
+    # 避免脚本在非交互（计划任务）环境下误杀正在使用的 WorkBuddy。
+    "auto_launch": False,
 }
 
 
@@ -532,21 +536,95 @@ def build_js(template, claim_text):
 
 
 def open_user_panel(ws_url, nickname):
-    """点击主界面左下角用户头像（显示名），打开签到面板（部分版本需此兜底）"""
+    """点击主界面左下角用户卡片（显示名），打开用户菜单（部分版本需此兜底）。
+
+    优先点击新版 UI 的 `button.user-menu-trigger`（5.5.x 结构），
+    找不到再按昵称文本匹配兜底。返回 {'opened': bool, 'via': str, 'target': str}。
+    """
     js = r"""
     (() => {
       const NICK = __NICKNAME__;
-      const els = [...document.querySelectorAll('*')].filter(e => {
-        const t = (e.textContent || '').trim();
-        return t.indexOf(NICK) === 0 && t.length < 20;
-      });
-      const el = els.filter(e => e.offsetParent !== null).pop();
-      if (!el) return false;
-      try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); return true; }
-      catch(e) { try { el.click(); return true; } catch(e2) { return false; } }
+      let via = 'nickname-fallback';
+      // 1) 新版 UI：左下角用户卡片触发器（button）。直接点按钮，click() 才会触发菜单
+      let btn = document.querySelector('button.user-menu-trigger') ||
+                document.querySelector('.user-menu-trigger');
+      if (btn) via = 'user-menu-trigger';
+      if (!btn) {
+        // 2) 兜底：匹配昵称文本开头的可见元素，优先 button，其次取最后一个
+        const hits = [...document.querySelectorAll('*')].filter(e => {
+          const t = (e.textContent || '').trim();
+          return t.indexOf(NICK) === 0 && t.length < 20;
+        }).filter(e => e.offsetParent !== null);
+        btn = hits.find(e => (e.tagName || '').toLowerCase() === 'button') ||
+              [...hits].pop();
+      }
+      if (!btn) return { opened: false, via, target: '' };
+      const tag = (btn.tagName || '').toLowerCase();
+      const cls = btn.className ? String(btn.className).slice(0, 60) : '';
+      try { btn.click(); return { opened: true, via, target: `${tag}.${cls}` }; }
+      catch (e) { return { opened: false, via, target: `${tag}.${cls} err=${e}` }; }
     })()
     """.replace("__NICKNAME__", json.dumps(nickname, ensure_ascii=False))
-    return bool(cdp_evaluate(ws_url, js))
+    res = cdp_evaluate(ws_url, js)
+    if isinstance(res, dict):
+        return res
+    return {"opened": bool(res), "via": "unknown", "target": ""}
+
+
+def click_fuel_menu_entry(ws_url):
+    """新版 UI（5.5.3+）：打开用户菜单后，点击菜单里的「Buddy加油站」条目
+    （div.fuel-menu-entry / label.fuel-menu-entry__label）才会展开签到面板。
+    支持 shadow DOM；'fuel' 类名未来若变化，可回退到文本定位兜底。
+    只接受视口内可见的元素（避免误点对话正文里的同名字符串）。"""
+    js = r"""
+    (() => {
+      function inViewport(el) {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 &&
+               r.top < (window.innerHeight || document.documentElement.clientHeight) &&
+               r.left < (window.innerWidth || document.documentElement.clientWidth);
+      }
+      // 1) 首选 .fuel-menu-entry（主文档 + shadow DOM），要求视口内可见
+      let entry = null;
+      const roots = [document];
+      while (roots.length) {
+        const root = roots.pop();
+        let els = [];
+        try { els = root.querySelectorAll ? [...root.querySelectorAll('.fuel-menu-entry')] : []; } catch (e) {}
+        for (const el of els) { if (inViewport(el)) { entry = el; break; } }
+        if (entry) break;
+        try { for (const el of root.querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot); } catch (e) {}
+      }
+      // 2) 文本兜底：找视口内「Buddy加油站」开头的元素，且能上溯到 fuel/按钮祖先
+      if (!entry) {
+        const all = [...document.querySelectorAll('*')];
+        const hit = all.filter(e => {
+          const t = (e.textContent || '').trim();
+          return t.indexOf('Buddy加油站') === 0 && t.length < 30 && inViewport(e);
+        }).pop();
+        if (hit) {
+          let up = hit;
+          for (let i = 0; i < 8 && up; i++) {
+            const tag = (up.tagName || '').toLowerCase();
+            const role = up.getAttribute ? up.getAttribute('role') : null;
+            if (tag === 'button' || tag === 'a' || role === 'button' ||
+                /fuel/.test(String(up.className || ''))) { entry = up; break; }
+            up = up.parentElement;
+          }
+        }
+      }
+      if (!entry) return 'no-entry';
+      const r = entry.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return 'invisible';
+      try {
+        entry.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        return 'clicked';
+      } catch (e) {
+        try { entry.click(); return 'clicked(native)'; } catch (e2) { return 'click-failed'; }
+      }
+    })()
+    """
+    return cdp_evaluate(ws_url, js)
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +648,9 @@ def get_work_targets(port):
     return work_targets or all_targets
 
 
-def run(cfg, dry=False, info_only=False, auto_launch=True):
+def run(cfg, dry=False, info_only=False, auto_launch=None):
+    if auto_launch is None:
+        auto_launch = bool(cfg.get("auto_launch", False))
     log_file = open(LOG_DIR / f"checkin_{datetime.now().strftime('%Y%m%d')}.log",
                     "a", encoding="utf-8")
     try:
@@ -624,6 +704,11 @@ def run(cfg, dry=False, info_only=False, auto_launch=True):
                 find_res = cdp_evaluate(ws_url, js_find)
                 log(f"查找按钮: {json.dumps(find_res, ensure_ascii=False)[:300]}", log_file)
                 if not isinstance(find_res, dict) or not find_res.get("found"):
+                    # 无「立即领取」按钮：先看是否已显示「已领」状态（今日已签到）
+                    verify = cdp_evaluate(ws_url, js_verify)
+                    if isinstance(verify, dict) and verify.get("hasClaimed"):
+                        log("  ✅ 今日已领取，无需重复签到", log_file)
+                        return "ALREADY"
                     log(f"  未找到「{cfg['claim_text']}」按钮，跳过", log_file)
                     continue
 
@@ -649,22 +734,40 @@ def run(cfg, dry=False, info_only=False, auto_launch=True):
             return "NO_BUTTON"
 
         rc = try_click_all()
-        # 未找到按钮：若配置了 nickname，点击左下角头像打开面板后重试
+        # 未找到按钮：点击左下角用户卡片打开用户菜单，再点「Buddy加油站」条目
+        # 展开签到面板（5.5.3+ UI），然后重试。菜单偶发打不开，最多循环 3 轮。
         if rc == "NO_BUTTON" and cfg.get("nickname"):
             main_page_ws = next((t.get("webSocketDebuggerUrl") for t in work_targets
                                  if "WorkBuddy" in (t.get("title") or "")), None)
             if main_page_ws:
-                log(f"未找到签到按钮，点击左下角用户头像（{cfg['nickname']}）打开面板...", log_file)
-                if open_user_panel(main_page_ws, cfg["nickname"]):
-                    time.sleep(3)
-                    log("面板已打开，重新查找...", log_file)
+                for round_no in range(1, 4):
+                    if rc != "NO_BUTTON":
+                        break
+                    log(f"第 {round_no}/3 轮：点击左下角用户卡片（{cfg['nickname']}）打开用户菜单...", log_file)
+                    opened = open_user_panel(main_page_ws, cfg["nickname"])
+                    log(f"打开用户菜单: {json.dumps(opened, ensure_ascii=False)[:200]}", log_file)
+                    if not opened.get("opened"):
+                        log(f"打开用户菜单失败: {opened.get('via', '?')} -> {opened.get('target', '')}", log_file)
+                        break
+                    # 菜单渲染有延迟，轮询等待「Buddy加油站」条目出现再点击
+                    fuel_click = "no-entry"
+                    tries = 0
+                    for tries in range(1, 9):
+                        time.sleep(1.2)
+                        fuel_click = click_fuel_menu_entry(main_page_ws)
+                        if fuel_click in ("clicked", "clicked(native)"):
+                            break
+                    log(f"菜单项点击结果(尝试{tries}次): {fuel_click}", log_file)
+                    if fuel_click not in ("clicked", "clicked(native)"):
+                        continue  # 菜单可能没真正打开，下一轮重试
+                    time.sleep(4)
+                    log("签到面板应已展开，重新查找...", log_file)
                     rc = try_click_all()
-                else:
-                    log(f"未找到「{cfg['nickname']}」头像元素", log_file)
             else:
                 log("未找到应用主页面", log_file)
 
-        log("❌ 所有页面均未找到可点击的签到按钮", log_file)
+        if rc not in ("OK", "ALREADY", "DRY_OK", "UNCERTAIN"):
+            log("❌ 所有页面均未找到可点击的签到按钮", log_file)
         return rc
 
     except requests.exceptions.ConnectionError:
@@ -784,9 +887,9 @@ def cmd_setup(cfg, register_task=True):
     # [4] 冒烟签到验证（不点击：dry 探测一次）
     print("\n[4/5] 签到链路自检...")
     rc = run(cfg, dry=True, auto_launch=False)
-    if rc in ("DRY_OK", "NO_BUTTON"):
+    if rc in ("DRY_OK", "NO_BUTTON", "ALREADY"):
         print("  ✅ 链路正常（能连接并扫描页面）。")
-        if rc == "NO_BUTTON":
+        if rc in ("NO_BUTTON", "ALREADY"):
             print("     （当前无「立即领取」按钮——可能今日已领，属正常）")
     else:
         print(f"  ⚠️ 自检返回 {rc}——配置完成但链路待观察，可稍后运行 "
@@ -810,7 +913,7 @@ def cmd_setup(cfg, register_task=True):
     print("=" * 62)
     print("  ✅ 配置完成！以后无需再操作：")
     print("     · 计划任务每天自动签到（错过会补跑）")
-    print("     · 若 WorkBuddy 未启动，签到前会自动拉起")
+    print("     · WorkBuddy 常驻时无需任何操作；若需自动拉起，将 config.json 的 auto_launch 设为 true")
     print("     手动补签/自检：python checkin_cdp.py")
     print("=" * 62)
     return 0
@@ -844,9 +947,9 @@ if __name__ == "__main__":
         if args.setup:
             sys.exit(cmd_setup(cfg))
         rc = run(cfg, dry=args.dry, info_only=args.info,
-                 auto_launch=not args.no_auto_launch)
+                 auto_launch=None if not args.no_auto_launch else False)
         print(f"\nRESULT: {rc}")
-        sys.exit(0 if rc in ("OK", "NO_BUTTON", "DRY_OK", "INFO_OK", "UNCERTAIN") else 1)
+        sys.exit(0 if rc in ("OK", "ALREADY", "NO_BUTTON", "DRY_OK", "INFO_OK", "UNCERTAIN") else 1)
     except Exception:
         import traceback
         crash_log = LOG_DIR / f"crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"

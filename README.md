@@ -23,14 +23,17 @@ python checkin_cdp.py --setup
 3. **自动生成配置** —— 从页面自动提取你的昵称写入 `config.json`，无需手填；自动校验签到按钮文案
 4. **注册每日计划任务** —— 确认后注册（默认每天 07:00 静默签到，**错过触发会自动补跑**，支持电池供电）
 
-跑完这 5 步，每天自动签到，**包括自动拉起 WorkBuddy**——以后连打开应用都省了。
+跑完这 5 步，每天自动签到。**默认不自动拉起/重启 WorkBuddy**——适合 WorkBuddy 常驻运行
+的场景；若需要"发现没开就自动拉起"，把 `config.json` 的 `auto_launch` 设为 `true` 即可。
 
-手动补签 / 自检：`python checkin_cdp.py`（发现 WorkBuddy 没开时会自动拉起再签）。
+手动补签 / 自检：`python checkin_cdp.py`（今日已领时自动识别并正常退出）。
+连不上调试服务时禁用自动拉起：`python checkin_cdp.py --no-auto-launch`。
 
 ## 特性
 
-- 🖱 自动查找并点击签到按钮（穿透 shadow DOM），点击后自动校验是否生效
-- 🚀 **自动拉起**：WorkBuddy 没运行时自动启动（带调试端口），无需手动打开
+- 🖱 自动查找并点击签到按钮（穿透 shadow DOM），点击后自动校验是否生效；今日已领自动识别
+- 🚀 **可选自动拉起**：默认关闭（适合 WorkBuddy 常驻场景）；`config.json` 的 `auto_launch: true`
+  可开启"没运行就自动启动（带调试端口）"
 - 🔌 端口自适应：固定端口被占时自动扫描本机 CDP 端口（仅接受目标应用）
 - 🌙 跨午夜自动刷新页面，避免界面仍显示"昨日已领"
 - ⚙️ 按钮文案 / 昵称 / 跳过端口全部可配置，应用改版时改 `config.json` 即可
@@ -59,6 +62,7 @@ copy config.example.json config.json
 | `nickname` | 主界面左下角用户显示名；留空则跳过"点头像打开面板"的兜底步骤 | `""` |
 | `skip_ports` | 自动扫描端口时要跳过的端口（本机有其他调试服务时） | `[]` |
 | `workbuddy_exe` | WorkBuddy 可执行文件路径；`auto` 为自动定位 | `"auto"` |
+| `auto_launch` | 连不上调试服务时是否自动拉起/重启 WorkBuddy（常驻场景建议 `false`） | `false` |
 
 配置优先级：内置默认 < 同目录 `config.json` < `--config` 指定文件 < 命令行参数。
 `config.json` 已在 `.gitignore` 中，含个人昵称也不会误提交。
@@ -67,10 +71,10 @@ copy config.example.json config.json
 
 ```bat
 python checkin_cdp.py --setup            :: 一键配置向导（首次）
-python checkin_cdp.py                    :: 正常签到（连不上会自动拉起 WorkBuddy）
+python checkin_cdp.py                    :: 正常签到（默认不拉起；auto_launch=true 时连不上会自动拉起）
 python checkin_cdp.py --dry              :: 只检测按钮，不点击
 python checkin_cdp.py --info             :: 打印端口与页面列表（先自检用这个）
-python checkin_cdp.py --no-auto-launch   :: 连不上调试服务时不自动拉起，直接报错
+python checkin_cdp.py --no-auto-launch   :: 强制禁用自动拉起，连不上直接报错
 python checkin_cdp.py --nickname 我的名字
 python checkin_cdp.py --claim-text 签到有礼
 ```
