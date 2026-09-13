@@ -43,8 +43,9 @@ python checkin_cdp.py --setup
 ## 环境要求
 
 - Windows 10/11
-- Python 3.9+（需 `requests`、`websocket-client`；自动拉起/进程管理建议安装 `psutil`、
-  计划任务完整功能建议安装 `pywin32`——缺省时均有降级路径）
+- Python 3.9+（唯一必需依赖是 `websocket-client`；HTTP 探测/CDP 列表用标准库实现，
+  不依赖 `requests`。自动拉起/进程管理建议安装 `psutil`、计划任务完整功能建议安装
+  `pywin32`——缺省时均有降级路径）
 - 已安装 WorkBuddy 桌面版
 
 ## 手动配置（可选）
@@ -118,7 +119,8 @@ python register_windows_task.py --at 07:00
 | `RESULT: NO_CDP` | WorkBuddy 没带 `--remote-debugging-port` 启动。先跑 `--setup` 一键修复，或查 `--info` |
 | `RESULT: NO_BUTTON` | 今日已领（正常）；或应用 UI 改版导致按钮文案变化——改 `config.json` 的 `claim_text` |
 | `未找到「XX」头像元素` | `nickname` 填错，或该版本无需点头像（可留空） |
-| 找不到 `websocket`/`requests` 模块 | `pip install -r requirements.txt` |
+| `RESULT: DEP_FAIL` | `websocket-client` 被清理工具破坏（包目录残留、缺 `create_connection`）。脚本会自动重装；失败时手动 `pip install --force-reinstall websocket-client` |
+| 脚本误报「端口无调试服务」 | 同上：第三方依赖损坏会被静默吞掉。现已改用标准库 + 启动依赖自检，日志里会打印「依赖自检」一行 |
 | 向导等待登录时卡住 | 确认 WorkBuddy 窗口已弹出并完成登录；超时 5 分钟可重跑 `--setup` |
 | 找不到 WorkBuddy 安装位置 | 在 `config.json` 的 `workbuddy_exe` 填完整路径 |
 

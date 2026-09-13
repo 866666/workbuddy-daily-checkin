@@ -32,7 +32,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -41,11 +43,68 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import requests
-import websocket
-
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+# 只连本机 CDP（127.0.0.1），显式禁用代理：环境变量里的 HTTP_PROXY 会拦截本地请求
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def http_get(url, timeout=3):
+    """标准库 HTTP GET（不依赖第三方 requests）。返回 (status, text)。
+
+    与本项目业务无关的依赖（如 requests）曾因 WorkBuddy 升级时的清理被破坏，
+    导致脚本误报「端口无调试服务」。这里改用标准库，从根上避免该类问题。
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "workbuddy-daily-checkin"})
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def load_websocket():
+    """延迟导入并校验 websocket-client。
+
+    包文件被清理时，Python 会把残余目录当命名空间包，import 表面成功但缺函数；
+    这里显式校验并返回 (module, error)。
+    """
+    try:
+        import websocket  # noqa: PLC0415
+    except Exception as e:
+        return None, f"导入失败: {e}"
+    if not hasattr(websocket, "create_connection"):
+        return None, "模块不完整（create_connection 缺失，可能被清理工具破坏）"
+    return websocket, None
+
+
+def check_deps(auto_repair=True):
+    """启动自检：websocket-client 是签到链路必需依赖。损坏时尝试自动重装。
+
+    返回 (ok, message)。
+    """
+    ws, err = load_websocket()
+    if ws is not None:
+        return True, f"websocket-client {getattr(ws, '__version__', '?')}"
+    msg = f"⚠️ 依赖异常：websocket-client {err}"
+    if not auto_repair:
+        return False, msg
+    msg += "；尝试自动重装..."
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir",
+             "-q", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", "websocket-client"],
+            capture_output=True, text=True, timeout=180)
+        ws2, err2 = load_websocket()
+        if ws2 is not None:
+            return True, f"{msg} 重装成功（{getattr(ws2, '__version__', '?')}）"
+        return False, f"{msg} 重装后仍不可用（{err2}）。请手动运行: {sys.executable} -m pip install websocket-client"
+    except Exception as e:
+        return False, f"{msg} 自动重装失败: {e}。请手动运行: {sys.executable} -m pip install websocket-client"
+
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -229,20 +288,14 @@ def launch_workbuddy(exe, port):
 # ---------------------------------------------------------------------------
 def cdp_available(port, timeout=1.5):
     """端口上是否有可用的 CDP 服务"""
-    try:
-        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
-        return resp.status_code == 200 and "Browser" in resp.text
-    except Exception:
-        return False
+    status, text = http_get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
+    return status == 200 and "Browser" in text
 
 
 def cdp_is_workbuddy(port, timeout=1.5):
     """该端口 CDP 是否属于 WorkBuddy"""
-    try:
-        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
-        return resp.status_code == 200 and "workbuddy" in resp.text.lower()
-    except Exception:
-        return False
+    status, text = http_get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
+    return status == 200 and "workbuddy" in text.lower()
 
 
 def detect_debug_port(cfg):
@@ -272,15 +325,12 @@ def detect_debug_port(cfg):
         if p in seen:
             continue
         seen.add(p)
-        try:
-            resp = requests.get(f"http://127.0.0.1:{p}/json", timeout=0.5)
-            data = resp.json()
-            if isinstance(data, list) and data:
-                # 只接受 WorkBuddy 的调试服务，避免误连其他浏览器
-                if cdp_is_workbuddy(p):
-                    return p
-        except Exception:
-            continue
+        # 该端口是否有 CDP 列表接口（返回 JSON 数组即说明有调试服务）
+        status, text = http_get(f"http://127.0.0.1:{p}/json", timeout=0.8)
+        if status == 200 and text.lstrip().startswith("["):
+            # 只接受 WorkBuddy 的调试服务，避免误连其他浏览器
+            if cdp_is_workbuddy(p):
+                return p
     return port
 
 
@@ -329,15 +379,23 @@ def ensure_cdp(cfg):
 
 
 def get_targets(port):
-    resp = requests.get(f"http://127.0.0.1:{port}/json", timeout=3)
-    resp.raise_for_status()
-    return resp.json()
+    """获取 CDP 调试目标列表（标准库实现，不依赖 requests）"""
+    status, text = http_get(f"http://127.0.0.1:{port}/json", timeout=3)
+    if status != 200:
+        raise RuntimeError(f"CDP /json 返回 {status}: {text[:120]}")
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise RuntimeError(f"CDP /json 返回非列表: {text[:120]}")
+    return data
 
 
 def cdp_evaluate(ws_url, js_expr, timeout=10):
     """连接 WebSocket 执行 JS，返回返回值"""
+    ws_mod, err = load_websocket()
+    if ws_mod is None:
+        raise RuntimeError(f"websocket-client 不可用: {err}")
     # suppress_origin: Chromium 138+ 默认拒绝带 Origin 的调试连接
-    ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+    ws = ws_mod.create_connection(ws_url, timeout=timeout, suppress_origin=True)
     try:
         msg = json.dumps({
             "id": 1,
@@ -357,7 +415,10 @@ def cdp_evaluate(ws_url, js_expr, timeout=10):
 
 def cdp_reload(ws_url, wait=7):
     """刷新页面。跨午夜后界面可能缓存昨日签到状态，刷新后才能看到今日按钮。"""
-    ws = websocket.create_connection(ws_url, timeout=15, suppress_origin=True)
+    ws_mod, err = load_websocket()
+    if ws_mod is None:
+        raise RuntimeError(f"websocket-client 不可用: {err}")
+    ws = ws_mod.create_connection(ws_url, timeout=15, suppress_origin=True)
     try:
         ws.send(json.dumps({"id": 1, "method": "Page.reload", "params": {}}))
         while True:
@@ -654,6 +715,14 @@ def run(cfg, dry=False, info_only=False, auto_launch=None):
     log_file = open(LOG_DIR / f"checkin_{datetime.now().strftime('%Y%m%d')}.log",
                     "a", encoding="utf-8")
     try:
+        # 依赖自检：websocket-client 若被清理工具破坏，Python 会把它当命名空间包
+        # 静默导入成功，导致误报「端口无调试服务」。这里显式校验并自动重装。
+        deps_ok, deps_msg = check_deps(auto_repair=True)
+        log(f"依赖自检: {deps_msg}", log_file)
+        if not deps_ok:
+            log("❌ 依赖不可用，签到链路无法建立", log_file)
+            return "DEP_FAIL"
+
         # 探测端口；若不可用且允许自动拉起，则自动启动 WorkBuddy
         port = detect_debug_port(cfg)
         if not cdp_is_workbuddy(port):
@@ -770,8 +839,8 @@ def run(cfg, dry=False, info_only=False, auto_launch=None):
             log("❌ 所有页面均未找到可点击的签到按钮", log_file)
         return rc
 
-    except requests.exceptions.ConnectionError:
-        log(f"❌ 无法连接 CDP 端口 {cfg['debug_port']}，"
+    except (ConnectionError, OSError) as e:
+        log(f"❌ 无法连接 CDP 端口 {cfg['debug_port']}（{e}），"
             "请确认目标应用已带 --remote-debugging-port 启动", log_file)
         return "NO_CDP"
     except Exception as e:
@@ -944,6 +1013,13 @@ if __name__ == "__main__":
 
     # 全局保护：pythonw 静默运行时任何未捕获异常都落盘，避免无痕失败
     try:
+        # 依赖自检提前到入口（--setup 在 run() 之前就会用到 websocket 执行 JS）
+        deps_ok, deps_msg = check_deps(auto_repair=True)
+        print(f"依赖自检: {deps_msg}")
+        if not deps_ok:
+            print("❌ 依赖不可用，请先修复后再运行")
+            sys.exit(1)
+
         if args.setup:
             sys.exit(cmd_setup(cfg))
         rc = run(cfg, dry=args.dry, info_only=args.info,

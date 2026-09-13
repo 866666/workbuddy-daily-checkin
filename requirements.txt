@@ -1,4 +1,6 @@
-requests>=2.31
+# HTTP 探测/CDP 列表接口统一用标准库 urllib 实现（见 checkin_cdp.py 的 http_get），
+# 不再依赖第三方 requests——requests 曾在 WorkBuddy 升级清理时被破坏成命名空间包，
+# 静默导致脚本误报「端口无调试服务」。
 websocket-client>=1.6
 psutil>=5.9
 pywin32>=306; sys_platform == "win32"
