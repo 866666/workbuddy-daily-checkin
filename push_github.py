@@ -13,6 +13,8 @@
 
     python push_github.py --repo 866666/workbuddy-daily-checkin --branch main \\
         -m "commit message" file1 path2 dir3/...
+    python push_github.py --repo OWNER/REPO --branch main -m "cleanup" \\
+        --delete old_module.py --delete archive/stale.py
     python push_github.py --token-env GITHUB_TOKEN ...   # 从环境变量读 token
                                                          # （默认读 ~/.workbuddy/credentials/github-pat.txt）
 
@@ -20,6 +22,7 @@
 ----
 - 远程文件请从本地完整内容覆盖；新增文件直接 PUT；无需提供 blob SHA。
 - 目录参数会递归加入（例如传 ``archive``）；注意别把 logs/、config.json、state.json 传进来。
+- ``--delete`` 只写**仓库内相对路径**（不是本地路径），可与新增/更新在同一个 commit 里提交。
 """
 import argparse
 import base64
@@ -64,6 +67,18 @@ def api(method, url, token, payload=None):
     return json.loads(body) if body.strip() else None
 
 
+def relpath(p):
+    """相对当前目录的 POSIX 路径。
+
+    注意：不要用 ``str.lstrip("./")`` —— lstrip 按字符集合剥离，
+    会把 ``.gitignore`` 开头的点也吃掉，变成 ``gitignore``（曾踩过）。
+    """
+    rel = Path(p).as_posix()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel
+
+
 def load_token(args):
     if args.token_env:
         tok = os.environ.get(args.token_env)
@@ -82,7 +97,9 @@ def main():
     ap.add_argument("-m", "--message", required=True, help="commit message")
     ap.add_argument("--token-env", default=None,
                     help="从环境变量读 token（默认读 ~/.workbuddy/credentials/github-pat.txt）")
-    ap.add_argument("paths", nargs="+", help="要推送的本地文件/目录（目录递归）")
+    ap.add_argument("--delete", action="append", default=[], metavar="PATH",
+                    help="从仓库删除该路径（可重复；只写仓库内相对路径，如 old/file.py）")
+    ap.add_argument("paths", nargs="*", help="要推送的本地文件/目录（目录递归）")
     args = ap.parse_args()
 
     token = load_token(args)
@@ -101,12 +118,12 @@ def main():
                         seen.add(rel)
                         files.append((rel, f.read_bytes()))
         elif p.is_file():
-            rel = p.as_posix().lstrip("./")
+            rel = relpath(p)
             if rel not in seen:
                 seen.add(rel)
                 files.append((rel, p.read_bytes()))
-    if not files:
-        raise SystemExit("没有可推送的文件")
+    if not files and not args.delete:
+        raise SystemExit("没有可推送的文件（也没有用 --delete 指定要删除的路径）")
 
     # 1) 验证 token + 取当前分支 commit/tree
     me = api("GET", f"{API}/user", token)
@@ -125,7 +142,9 @@ def main():
         tree_items.append({"path": rel, "mode": "100644", "type": "blob", "sha": blob["sha"]})
         print(f"  blob {rel} -> {blob['sha'][:10]}")
 
-    # 3) 新树（基于远端当前树，仅更新列出的路径）
+    # 3) 新树（基于远端当前树，仅更新列出的路径；sha=None 表示删除该条目）
+    tree_items += [{"path": d, "mode": "100644", "type": "blob", "sha": None}
+                   for d in args.delete]
     tree = api("POST", f"{API}/repos/{owner}/{repo}/git/trees", token,
                payload={"base_tree": base_tree, "tree": tree_items})
     print(f"新树: {tree['sha'][:10]}")
@@ -138,7 +157,9 @@ def main():
     # 5) 更新分支引用
     api("PATCH", f"{API}/repos/{owner}/{repo}/git/refs/heads/{args.branch}", token,
         payload={"sha": commit["sha"], "force": False})
-    print(f"✅ 推送完成: {args.branch} -> {commit['sha'][:10]} ({len(files)} 个文件, 1 个 commit)")
+    extra = f"，删除 {len(args.delete)} 项" if args.delete else ""
+    print(f"✅ 推送完成: {args.branch} -> {commit['sha'][:10]} "
+          f"({len(files)} 个文件{extra}, 1 个 commit)")
 
 
 if __name__ == "__main__":
