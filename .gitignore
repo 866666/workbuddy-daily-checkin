@@ -7,6 +7,10 @@ __pycache__/
 # 个人配置（含账号显示名，勿入库）
 config.json
 
+# 守卫运行时状态（每日核验记录/基线）
+state.json
+state.json.tmp
+
 # 诊断/调试
 diag/
 *.png
