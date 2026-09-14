@@ -28,6 +28,7 @@ WorkBuddy 是 Electron/Chromium 应用。以 ``--remote-debugging-port=9222`` �
 """
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -590,6 +591,50 @@ JS_SCAN_CLAIM_CANDIDATES = r"""
 })()
 """
 
+# 读取 Buddy加油站 面板状态（2026-09-14 于 5.5.6 实测的真实结构）：
+#   section.fuel-card.fuel-compact  折叠态（不可见）：fuel-title / fuel-subtitle / button.fuel-btn
+#   section.fuel-card.fuel-expanded 展开态（可见）：
+#     .fuel-expanded-title=期数活动名  .fuel-score=今日可领额度  .fuel-caption
+#     .fuel-stats = 「已领 12 天 累计领取 1200 分」← 单调计数器，到账的关键副证据
+#     .fuel-period/.fuel-end-tag=期数与结束日
+#     .fuel-actions 内两个 button.fuel-btn：主签到按钮 + fuel-secondary（"认证领积分"）
+#       —— 主按钮已领时文案「今日已领」且 disabled=true；绝不能误点 fuel-secondary
+JS_PANEL_STATE = r"""
+(() => {
+  function deepQuery(sel) {
+    const roots = [document];
+    while (roots.length) {
+      const r = roots.pop();
+      let hit = null;
+      try { hit = r.querySelector(sel); } catch (e) {}
+      if (hit) return hit;
+      try { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot); } catch (e) {}
+    }
+    return null;
+  }
+  const card = deepQuery('section.fuel-card.fuel-expanded') || deepQuery('section.fuel-card');
+  if (!card) return { open: false, reason: 'no .fuel-card (panel closed)' };
+  const T = (el) => (el && el.innerText ? el.innerText.trim().replace(/\s+/g, ' ') : '');
+  const main = [...card.querySelectorAll('button.fuel-btn')]
+      .filter(b => !/fuel-secondary/.test(String(b.className || '')))[0] || null;
+  return {
+    open: true,
+    panelText: T(card).slice(0, 300),
+    score: T(deepQuery('.fuel-score')),
+    caption: T(deepQuery('.fuel-caption')),
+    stats: T(deepQuery('.fuel-stats')),
+    period: T(deepQuery('.fuel-period')),
+    endTag: T(deepQuery('.fuel-end-tag')),
+    btnText: main ? T(main) : '',
+    btnDisabled: main ? (main.disabled === true) : null,
+    hasSecondary: !!deepQuery('button.fuel-btn.fuel-secondary')
+  };
+})()
+"""
+
+# 已领取状态文案（面板按钮 / 通用叶子文本共用）
+CLAIMED_RE = re.compile(r"今日已领|已领取|已签到|今日已|已打卡|已领")
+
 
 def build_js(template, claim_text):
     return template.replace("__CLAIM_TEXT__",
@@ -688,6 +733,111 @@ def click_fuel_menu_entry(ws_url):
     return cdp_evaluate(ws_url, js)
 
 
+def parse_fuel_stats(text):
+    """从 .fuel-stats 文本（如「已领 12 天 累计领取 1200 分」）解析 (天数, 累计积分)。
+
+    这是「当天积分是否真的到账」的关键副证据：累计积分是单调递增计数器，
+    跨日比对（今天 > 基线）即可证明当天确实入账，而不只是界面文案变了。
+    解析不到返回 None。
+    """
+    days = points = None
+    if text:
+        m = re.search(r"(\d+)\s*天", text)
+        if m:
+            days = int(m.group(1))
+        m = re.search(r"累计领取\s*(\d+)", text)
+        if m:
+            points = int(m.group(1))
+        else:
+            m = re.search(r"(\d+)\s*分", text)
+            if m:
+                points = int(m.group(1))
+    return days, points
+
+
+def find_main_ws(port):
+    """返回 WorkBuddy 主页面（title 含 WorkBuddy）的 WebSocket 调试地址"""
+    targets = get_work_targets(port)
+    for t in targets:
+        if "WorkBuddy" in (t.get("title") or "") and t.get("webSocketDebuggerUrl"):
+            return t["webSocketDebuggerUrl"]
+    return targets[0]["webSocketDebuggerUrl"] if targets else None
+
+
+def read_panel_state(ws_url):
+    """读取加油站面板状态。
+
+    返回 dict，含 open / btnText / btnDisabled / stats / total_days / total_points 等。
+    面板未展开时 open=False（调用方可用 open_fuel_panel() 打开）。
+    """
+    res = cdp_evaluate(ws_url, JS_PANEL_STATE)
+    if not isinstance(res, dict):
+        return {"open": False, "reason": f"evaluate 返回异常: {res}"}
+    if res.get("open"):
+        days, points = parse_fuel_stats(res.get("stats", ""))
+        res["total_days"] = days
+        res["total_points"] = points
+    return res
+
+
+def open_fuel_panel(ws_url, nickname, rounds=3, logf=None):
+    """打开用户菜单 → 点「Buddy加油站」条目 → 展开签到面板（可复用，供守卫调用）。
+
+    菜单渲染有延迟，每轮内轮询等待条目出现再点；最多 rounds 轮。
+    返回 'opened' 或 'fail'。logf 为可选的日志函数。
+    """
+    def _log(m):
+        if logf:
+            logf(m)
+
+    # 面板可能已经展开：此时再点用户卡片会把菜单/面板关掉（toggle），先探测一下
+    if read_panel_state(ws_url).get("open"):
+        _log("  签到面板已展开，无需重新打开")
+        return "opened"
+
+    for r in range(1, rounds + 1):
+        res = open_user_panel(ws_url, nickname or "")
+        _log(f"  打开用户菜单(第 {r}/{rounds} 轮): "
+             f"{json.dumps(res, ensure_ascii=False)[:160]}")
+        if not res.get("opened"):
+            continue
+        clicked = "no-entry"
+        for _t in range(8):
+            time.sleep(1.2)
+            clicked = click_fuel_menu_entry(ws_url)
+            if clicked in ("clicked", "clicked(native)"):
+                break
+        _log(f"  「Buddy加油站」条目: {clicked}")
+        if clicked in ("clicked", "clicked(native)"):
+            time.sleep(3.5)
+            if read_panel_state(ws_url).get("open"):
+                return "opened"
+    return "fail"
+
+
+def close_fuel_panel(ws_url):
+    """收起签到面板，把界面恢复原状（守卫收尾用）。返回 True/False。"""
+    js = r"""
+    (() => {
+      function deepQuery(sel) {
+        const roots = [document];
+        while (roots.length) {
+          const r = roots.pop();
+          let hit = null;
+          try { hit = r.querySelector(sel); } catch (e) {}
+          if (hit) return hit;
+          try { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot); } catch (e) {}
+        }
+        return null;
+      }
+      const btn = deepQuery('button.fuel-close') || deepQuery('button.fuel-compact-close');
+      if (!btn) return false;
+      try { btn.click(); return true; } catch (e) { return false; }
+    })()
+    """
+    return bool(cdp_evaluate(ws_url, js))
+
+
 # ---------------------------------------------------------------------------
 # 签到主流程
 # ---------------------------------------------------------------------------
@@ -709,7 +859,12 @@ def get_work_targets(port):
     return work_targets or all_targets
 
 
-def run(cfg, dry=False, info_only=False, auto_launch=None):
+def run(cfg, dry=False, info_only=False, auto_launch=None, reload=True):
+    """执行签到主流程。
+
+    reload=False 时不刷新页面——守卫在白天（用户可能正在使用 WorkBuddy）先走这条
+    无打扰路径，只有确实领不到时才升级到刷新重试。
+    """
     if auto_launch is None:
         auto_launch = bool(cfg.get("auto_launch", False))
     log_file = open(LOG_DIR / f"checkin_{datetime.now().strftime('%Y%m%d')}.log",
@@ -749,7 +904,7 @@ def run(cfg, dry=False, info_only=False, auto_launch=None):
         log(f"候选目标: {len(work_targets)} 个", log_file)
 
         # 跨午夜后刷新页面，避免界面仍显示昨日签到状态
-        if work_targets:
+        if reload and work_targets:
             log("刷新页面以获取最新签到状态...", log_file)
             cdp_reload(work_targets[0]["webSocketDebuggerUrl"])
             log("页面已刷新", log_file)
@@ -806,31 +961,18 @@ def run(cfg, dry=False, info_only=False, auto_launch=None):
         # 未找到按钮：点击左下角用户卡片打开用户菜单，再点「Buddy加油站」条目
         # 展开签到面板（5.5.3+ UI），然后重试。菜单偶发打不开，最多循环 3 轮。
         if rc == "NO_BUTTON" and cfg.get("nickname"):
-            main_page_ws = next((t.get("webSocketDebuggerUrl") for t in work_targets
-                                 if "WorkBuddy" in (t.get("title") or "")), None)
+            main_page_ws = find_main_ws(port)
             if main_page_ws:
                 for round_no in range(1, 4):
                     if rc != "NO_BUTTON":
                         break
-                    log(f"第 {round_no}/3 轮：点击左下角用户卡片（{cfg['nickname']}）打开用户菜单...", log_file)
-                    opened = open_user_panel(main_page_ws, cfg["nickname"])
-                    log(f"打开用户菜单: {json.dumps(opened, ensure_ascii=False)[:200]}", log_file)
-                    if not opened.get("opened"):
-                        log(f"打开用户菜单失败: {opened.get('via', '?')} -> {opened.get('target', '')}", log_file)
-                        break
-                    # 菜单渲染有延迟，轮询等待「Buddy加油站」条目出现再点击
-                    fuel_click = "no-entry"
-                    tries = 0
-                    for tries in range(1, 9):
-                        time.sleep(1.2)
-                        fuel_click = click_fuel_menu_entry(main_page_ws)
-                        if fuel_click in ("clicked", "clicked(native)"):
-                            break
-                    log(f"菜单项点击结果(尝试{tries}次): {fuel_click}", log_file)
-                    if fuel_click not in ("clicked", "clicked(native)"):
-                        continue  # 菜单可能没真正打开，下一轮重试
-                    time.sleep(4)
-                    log("签到面板应已展开，重新查找...", log_file)
+                    log(f"第 {round_no}/3 轮：打开签到面板（左下角用户卡片 → Buddy加油站）...",
+                        log_file)
+                    r = open_fuel_panel(main_page_ws, cfg["nickname"], rounds=1,
+                                        logf=lambda m: log(m, log_file))
+                    if r != "opened":
+                        continue  # 菜单/面板没打开，下一轮重试
+                    log("签到面板已展开，重新查找...", log_file)
                     rc = try_click_all()
             else:
                 log("未找到应用主页面", log_file)
@@ -965,16 +1107,21 @@ def cmd_setup(cfg, register_task=True):
               "`python checkin_cdp.py --dry` 复查。")
 
     # [5] 注册每日计划任务
-    print("\n[5/5] 注册每日自动签到...")
-    if register_task and ask_yes_no("  是否注册 Windows 计划任务（默认每天 07:00 自动签到）?",
+    print("\n[5/5] 注册每日自动签到与守卫...")
+    if register_task and ask_yes_no("  是否注册 Windows 计划任务（每天 07:00 签到 + 全天守卫核验）?",
                                     default=True):
         try:
             import register_windows_task as rwt
             rwt.register(task_name=rwt.DEFAULT_NAME, at="07:00",
                          script=str(Path(__file__).resolve()))
+            # 守卫：07:00 之后每 2 小时核验一次，未到账则自动修复重试（见 checkin_guard.py）
+            rwt.register_guard(task_name=rwt.GUARD_NAME,
+                               script=str(Path(__file__).resolve().parent / "checkin_guard.py"),
+                               extra_args="--no-auto-launch")
         except Exception as e:
             print(f"  ⚠️ 注册计划任务失败: {e}")
             print("     可稍后手动运行: python register_windows_task.py")
+            print("                 python register_windows_task.py --guard")
     else:
         print("  跳过计划任务注册。手动签到：python checkin_cdp.py")
 
