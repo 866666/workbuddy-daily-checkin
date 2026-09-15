@@ -439,7 +439,20 @@ def cmd_status(cfg):
 
 
 class _NullLog:
+    """只读模式（--status）下的空日志对象。
+
+    必须同时兼容两种用法，否则实时面板探测会中途抛异常：
+      - logfile 用法：`log()` 会调用 .write()/.flush()
+      - logf 用法：`open_fuel_panel(logf=...)` 会当函数调用
+    """
+
     def __call__(self, msg):
+        pass
+
+    def write(self, s):
+        return len(s) if isinstance(s, str) else 0
+
+    def flush(self):
         pass
 
 
