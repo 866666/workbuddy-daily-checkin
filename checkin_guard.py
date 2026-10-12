@@ -345,6 +345,7 @@ def try_api_checkin(baseline, logfile):
     cr = data.get("checkin_result") or {}
     action = cr.get("action")
     credits = data.get("total_credits")
+    total_days = data.get("checkin_dates_total")
     ev, flags = [], []
 
     base_pts = (baseline or {}).get("total_points")
@@ -382,7 +383,8 @@ def try_api_checkin(baseline, logfile):
 
     log(f"[API] 判定: {verdict}/{conf} | " + " ; ".join(ev), logfile)
     return {"verdict": verdict, "confidence": conf, "evidence": ev, "flags": flags,
-            "credits": credits, "action": action, "degraded": degraded}
+            "credits": credits, "total_days": total_days,
+            "action": action, "degraded": degraded}
 
 
 def check_environment(cfg, logfile):
@@ -453,7 +455,7 @@ def guard_once(cfg, force=False, auto_launch=None):
         if api and api["verdict"] == "verified":
             panel = {"open": True, "btnText": f"(API {api['action']})",
                      "btnDisabled": None, "total_points": api.get("credits"),
-                     "total_days": None, "score": None, "reason": None}
+                     "total_days": api.get("total_days"), "score": None, "reason": None}
             record(st, today, panel, baseline, "verified", api["confidence"],
                    api["evidence"], api["flags"], attempts, source="api")
             log(f"✅ 当天积分已确认到账（{api.get('credits')} 分，"
@@ -510,9 +512,14 @@ def guard_once(cfg, force=False, auto_launch=None):
 
         record(st, today, panel2, baseline, "unverified", "none", ev2, flags2,
                attempts, source="guard", rc=rc_used)
-        return _fail(st, today, attempts,
-                     f"签到流程（含刷新重试）返回 {rc_used}，仍未确认到账",
-                     " ; ".join(ev2), logfile, panel=panel2)
+        if rc_used == "OK":
+            # 领取动作本身成功了，只是界面读不到状态（5.8.1 起面板改为滚动气泡）。
+            # 这类"假失败"必须说清楚，否则会被误判成丢分。
+            reason = ("签到流程返回 OK，但界面核验未通过 —— 5.8.1 起签到面板改为滚动气泡、"
+                      "已读不到状态。请以 API 路径的判定为准，勿据此认定丢分")
+        else:
+            reason = f"签到流程（含刷新重试）返回 {rc_used}，仍未确认到账"
+        return _fail(st, today, attempts, reason, " ; ".join(ev2), logfile, panel=panel2)
 
     except Exception as e:
         import traceback
