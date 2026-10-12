@@ -632,6 +632,25 @@ JS_PANEL_STATE = r"""
 })()
 """
 
+# 判断这个 target 是不是「应用主窗口」：多窗口时要靠它把设置窗口排除掉
+JS_HAS_APP_UI = r"""
+(() => {
+  function deepHas(sel) {
+    const roots = [document];
+    while (roots.length) {
+      const r = roots.pop();
+      let hit = null;
+      try { hit = r.querySelector(sel); } catch (e) {}
+      if (hit) return true;
+      try { for (const el of r.querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot); } catch (e) {}
+    }
+    return false;
+  }
+  return deepHas('button.user-menu-trigger') || deepHas('.user-menu-trigger') ||
+         deepHas('section.fuel-card') || deepHas('.user-menu-trigger-name');
+})()
+"""
+
 # 已领取状态文案（面板按钮 / 通用叶子文本共用）
 CLAIMED_RE = re.compile(r"今日已领|已领取|已签到|今日已|已打卡|已领")
 
@@ -755,13 +774,30 @@ def parse_fuel_stats(text):
     return days, points
 
 
-def find_main_ws(port):
-    """返回 WorkBuddy 主页面（title 含 WorkBuddy）的 WebSocket 调试地址"""
-    targets = get_work_targets(port)
+def find_main_ws(port, prefer_app_ui=True):
+    """返回 WorkBuddy **应用主窗口**的 WebSocket 调试地址。
+
+    坑（2026-10-12 于 5.8.1 实测）：WorkBuddy 可能同时存在多个 page target
+    （例如用户打开了「设置」窗口）。`/json` 的返回顺序不保证，盲取第一个会拿到
+    设置窗口 —— 那里既没有用户卡片也没有加油站面板，于是「打开面板失败」。
+    这里改为优先挑 **DOM 里真的有用户卡片** 的那个窗口。
+    """
+    targets = [t for t in get_work_targets(port) if t.get("webSocketDebuggerUrl")]
+    if not targets:
+        return None
+    # 多窗口时才做 DOM 探测（单窗口没必要多花一次往返）
+    if prefer_app_ui and len(targets) > 1:
+        for t in targets:
+            try:
+                if cdp_evaluate(t["webSocketDebuggerUrl"], JS_HAS_APP_UI, timeout=6):
+                    return t["webSocketDebuggerUrl"]
+            except Exception:
+                continue
+    # 单窗口，或都没探测到应用 UI：退回按标题匹配
     for t in targets:
-        if "WorkBuddy" in (t.get("title") or "") and t.get("webSocketDebuggerUrl"):
+        if "WorkBuddy" in (t.get("title") or ""):
             return t["webSocketDebuggerUrl"]
-    return targets[0]["webSocketDebuggerUrl"] if targets else None
+    return targets[0]["webSocketDebuggerUrl"]
 
 
 def read_panel_state(ws_url):

@@ -10,14 +10,29 @@
 本脚本作为「守卫」，由 **WorkBuddy 的定时任务**在每天 **07:30**（主签到 07:00 之后）调用一次：
 核验当天积分是否到账，未到账就自动排查 → 修复 → 重试，仍失败则告警。
 
+两条领取路径（2026-10-12 起）
+---------------------------
+**路径 A · API（优先）** —— 调 WorkBuddy 自己的接口，幂等、不依赖界面。
+2026-10-12 起启用：WorkBuddy 升到 5.8.1 后，签到面板从固定 DOM 改成了**滚动气泡**，
+`section.fuel-card` / `.fuel-stats` 抓不到，界面路径不再可靠。接口路径不受改版影响。
+
+**路径 B · CDP 兜底** —— 本项目原有的界面点击方式（点头像卡片 → Buddy加油站 → 点「立即领取」）。
+接口不可用（没装技能 / 外网不通）时接管；对不依赖技能的独立使用者仍可单独使用。
+
+两条路径的"到账"判定共用同一套证据逻辑，且都会写进 state.json。
+
 核心概念
 --------
 - **调度**：WorkBuddy 定时任务，每天 07:30 一次（不用 Windows 计划任务）。
 - **幂等**：当天已确认到账时立即退出（毫秒级），所以误触发或手动重跑都无副作用。
 - **双证据验证**（不靠猜界面文案）：
-    1. 状态证据：`div.fuel-actions > button.fuel-btn` 文案匹配「今日已领」且 `disabled=true`
-    2. 计数证据：`div.fuel-stats` 的「累计领取 N 分」是单调计数器，比基线大 = 当天确实入账
+    - 路径 A：① 接口 `daily-checkin` 回报「今日已签到 / 签到成功」（权威）
+             ② 本期累计积分比历史基线增长（单调计数器）
+    - 路径 B：① 主签到按钮文案「今日已领」且 `disabled=true`
+             ② 面板「累计领取 N 分」比基线增长
   两条都成立 → high；只有一条 → medium（记录并留待复核）
+- **抗网络抖动**：本机到 `www.codebuddy.cn` 有间歇性 TLS 干扰。
+  先探连通性再调用，且只对**网络类**报错重试（登录态/权限类不重试）。
 - **状态文件**：state.json 记录每日核验结果与基线，跨日比对的基础。
 
 运行模式
@@ -41,6 +56,8 @@ import json
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
@@ -231,6 +248,143 @@ def raise_alert(today, reason, detail_lines):
 # ---------------------------------------------------------------------------
 # 守卫主流程
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 路径 A：API 优先签到（不依赖界面，抗 UI 改版）
+# ---------------------------------------------------------------------------
+# 2026-10-12 起启用：WorkBuddy 升到 5.8.1 后签到面板从固定 DOM 变成滚动气泡，
+# CDP 抓不到 → 界面路径不再可靠。改走 WorkBuddy 自己的接口（幂等），
+# CDP 保留为兜底（本机专属脚本，发布版仍可用界面路径）。
+SKILL_SCRIPT = (Path.home() / ".workbuddy" / "skills" / "totorosir-workbuddy-score"
+                / "scripts" / "buddy_station.py")
+API_HOME = "https://www.codebuddy.cn/"
+
+
+def api_ping(timeout=8, retries=3):
+    """探测 codebuddy.cn 连通性。本机对该域名有间歇性 TLS 干扰，先探再打。"""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for i in range(retries):
+        try:
+            with opener.open(API_HOME, timeout=timeout) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            if i < retries - 1:
+                time.sleep(2)
+    return False
+
+
+def run_skill(extra_args, timeout=120):
+    """调用技能脚本，返回 (returncode, stdout, stderr)。脚本不会打印 token。"""
+    cmd = [sys.executable, str(SKILL_SCRIPT), "--no-push"] + list(extra_args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except subprocess.TimeoutExpired:
+        return -1, "", "技能脚本超时"
+    except Exception as e:
+        return -1, "", f"{type(e).__name__}: {e}"
+
+
+def _is_network_error(msg):
+    """判断报错是否属于网络层间歇故障（值得重试），而非业务/凭据问题。
+
+    本机到 www.codebuddy.cn 有间歇性 TLS 干扰（实测 SSL UNEXPECTED_EOF /
+    handshake timed out / Remote end closed / HTTP 0），这类错误重试即可恢复；
+    登录态失效、参数错误之类则重试无意义。
+    """
+    m = (msg or "").lower()
+    return any(k in m for k in (
+        "http 0", "ssl", "eof", "timeout", "timed out", "handshake",
+        "urlopen", "remote end closed", "connection reset", "connection aborted",
+        "target closed", "incomplete read"))
+
+
+def try_api_checkin(baseline, logfile):
+    """接口方式签到 + 核验。
+
+    返回 dict（verdict/confidence/evidence/flags/credits/action）或
+    None —— 表示本路径不可用，应交给 CDP 兜底。
+    """
+    if not SKILL_SCRIPT.exists():
+        log(f"[API] 未找到技能脚本，跳过：{SKILL_SCRIPT}", logfile)
+        return None
+    if not api_ping():
+        log("[API] www.codebuddy.cn 不可达（本机对该域名有间歇 TLS 干扰），跳过", logfile)
+        return None
+
+    log("[API] 调用接口签到（幂等，不依赖界面）...", logfile)
+    data, degraded, err = None, False, ""
+    for attempt in range(1, 4):
+        rc, out, err = run_skill(["checkin", "--json"])
+        try:
+            data = json.loads(out)
+        except Exception:
+            data = None
+            degraded = True
+        msg = (((data or {}).get("checkin_result") or {}).get("message")) or err or ""
+        if data is not None and not _is_network_error(msg):
+            break
+        if attempt < 3 and _is_network_error(msg):
+            log(f"[API] 第 {attempt}/3 次遇网络干扰，3 秒后重试：{msg.strip()[:80]}", logfile)
+            time.sleep(3)
+            continue
+        break
+
+    if data is None:
+        # 技能在「签到后状态查询」失败时不输出 JSON；再单独查一次状态，用累计计数判定
+        log(f"[API] 签到未返回 JSON（rc={rc}）：{(err or '').strip()[:120]}", logfile)
+        rc2, out2, err2 = run_skill(["--json"])
+        try:
+            data = json.loads(out2)
+        except Exception:
+            log(f"[API] 状态查询同样失败 → 交给 CDP 兜底：{(err2 or '').strip()[:100]}", logfile)
+            return None
+        degraded = True
+
+    cr = data.get("checkin_result") or {}
+    action = cr.get("action")
+    credits = data.get("total_credits")
+    ev, flags = [], []
+
+    base_pts = (baseline or {}).get("total_points")
+    grew = None
+    if credits is not None and base_pts is not None:
+        d = credits - base_pts
+        if d > 0:
+            grew = True
+            ev.append(f"累计积分 {base_pts} → {credits}（+{d}）")
+        elif d == 0:
+            grew = False
+            ev.append(f"累计积分未变化（{credits}）")
+        else:
+            flags.append("period_reset")
+            ev.append(f"累计积分下降 {base_pts} → {credits}（疑似新一期，计数证据作废）")
+    elif credits is not None:
+        ev.append(f"无历史基线（首次运行），本次累计积分 {credits}")
+
+    if action == "skipped" and cr.get("already_checked_in"):
+        ev.insert(0, "接口报告：今日已签到（daily-checkin 返回 code 10001）")
+    elif action == "success":
+        ev.insert(0, "接口报告：签到成功")
+    elif action:
+        ev.insert(0, f"接口报告：{action} {cr.get('message') or ''}".strip())
+
+    api_ok = action in ("skipped", "success")
+    if api_ok:
+        verdict, conf = "verified", "high"          # 接口自身是权威判据
+    elif grew is True:
+        verdict, conf = "verified", "medium"        # 计数在长，接口只是没给出结论
+    else:
+        verdict, conf = "unverified", "none"
+    if degraded:
+        flags.append("api_degraded")
+
+    log(f"[API] 判定: {verdict}/{conf} | " + " ; ".join(ev), logfile)
+    return {"verdict": verdict, "confidence": conf, "evidence": ev, "flags": flags,
+            "credits": credits, "action": action, "degraded": degraded}
+
+
 def check_environment(cfg, logfile):
     """L1 依赖 + L2 通道。返回 (ok, port, msg)。"""
     deps_ok, deps_msg = cc.check_deps(auto_repair=True)
@@ -289,20 +443,33 @@ def guard_once(cfg, force=False, auto_launch=None):
             return "ALREADY_VERIFIED"
 
         attempts = int(rec.get("attempts", 0)) + 1
+        baseline = baseline_for(st, today)
         log(f"===== 守卫检查 #{attempts}（{today}）=====", logfile)
+        log(f"基线: {json.dumps(baseline, ensure_ascii=False)}", logfile)
 
-        # L1/L2
+        # ===== 路径 A：API 优先 =====
+        # 5.8.1 起签到面板改成滚动气泡、CDP 抓不到，故先走接口（幂等、不依赖界面）。
+        api = try_api_checkin(baseline, logfile)
+        if api and api["verdict"] == "verified":
+            panel = {"open": True, "btnText": f"(API {api['action']})",
+                     "btnDisabled": None, "total_points": api.get("credits"),
+                     "total_days": None, "score": None, "reason": None}
+            record(st, today, panel, baseline, "verified", api["confidence"],
+                   api["evidence"], api["flags"], attempts, source="api")
+            log(f"✅ 当天积分已确认到账（{api.get('credits')} 分，"
+                f"置信度 {api['confidence']}，来源 API）", logfile)
+            return "OK"
+
+        # ===== 路径 B：CDP 兜底（界面点击，适用于接口不可用/未到账的情况）=====
         ok, port, msg = check_environment(cfg, logfile)
         if not ok:
             return _fail(st, today, attempts, "环境不可用", msg, logfile)
 
-        baseline = baseline_for(st, today)
-        log(f"基线: {json.dumps(baseline, ensure_ascii=False)}", logfile)
-
         # L3 + 首次判定（可能主签到已领但没写状态，先白捡一次）
         panel = read_state_via_panel(port, cfg, logfile)
         if panel is None:
-            return _fail(st, today, attempts, "无法读取签到面板", "找不到主页面", logfile)
+            return _fail(st, today, attempts, "无法读取签到面板",
+                         "接口路径未到账，且找不到主页面", logfile)
 
         verdict, conf, ev, flags = judge(panel, baseline)
         log(f"核验: {verdict}/{conf} | " + " ; ".join(ev), logfile)
