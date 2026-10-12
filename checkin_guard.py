@@ -70,9 +70,6 @@ LOG_DIR = HERE / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_PATH = HERE / "state.json"
 STATE_KEEP_DAYS = 120          # state.json 只保留最近 N 天，避免无限膨胀
-FINAL_CHECK_HOUR = 7           # 当天唯一一次检查在 07:30（主签到 07:00 之后），
-                               # 因此 07:00 以后的守卫运行都视为「最后窗口」：失败立即告警，
-                               # 不留「下个检查点再试」的模糊结论。
 
 
 def _load_cc():
@@ -440,7 +437,7 @@ def read_state_via_panel(port, cfg, logfile):
     return cc.read_panel_state(ws)
 
 
-def guard_once(cfg, force=False, auto_launch=None, use_cdp=False):
+def guard_once(cfg, force=False, auto_launch=None, use_cdp=False, final=False):
     """执行一次守卫。
 
     use_cdp=False（默认）：只走接口路径。WorkBuddy 5.8.1 起签到面板改为滚动气泡，
@@ -483,17 +480,17 @@ def guard_once(cfg, force=False, auto_launch=None, use_cdp=False):
             ev = (api or {}).get("evidence") or []
             return _fail(st, today, attempts,
                          "接口路径未确认到账（未启用界面兜底）",
-                         "； ".join(ev) or "接口不可用", logfile)
+                         "； ".join(ev) or "接口不可用", logfile, final=final)
         log("[CDP] 已启用界面兜底路径", logfile)
         ok, port, msg = check_environment(cfg, logfile)
         if not ok:
-            return _fail(st, today, attempts, "环境不可用", msg, logfile)
+            return _fail(st, today, attempts, "环境不可用", msg, logfile, final=final)
 
         # L3 + 首次判定（可能主签到已领但没写状态，先白捡一次）
         panel = read_state_via_panel(port, cfg, logfile)
         if panel is None:
             return _fail(st, today, attempts, "无法读取签到面板",
-                         "接口路径未到账，且找不到主页面", logfile)
+                         "接口路径未到账，且找不到主页面", logfile, final=final)
 
         verdict, conf, ev, flags = judge(panel, baseline)
         log(f"核验: {verdict}/{conf} | " + " ; ".join(ev), logfile)
@@ -541,18 +538,24 @@ def guard_once(cfg, force=False, auto_launch=None, use_cdp=False):
                       "已读不到状态。请以 API 路径的判定为准，勿据此认定丢分")
         else:
             reason = f"签到流程（含刷新重试）返回 {rc_used}，仍未确认到账"
-        return _fail(st, today, attempts, reason, " ; ".join(ev2), logfile, panel=panel2)
+        return _fail(st, today, attempts, reason, " ; ".join(ev2), logfile,
+                     panel=panel2, final=final)
 
     except Exception as e:
         import traceback
         log(f"❌ 守卫异常: {e}\n{traceback.format_exc()}", logfile)
-        return _fail(load_state(), today, 99, f"守卫异常: {e}", "", logfile)
+        return _fail(load_state(), today, 99, f"守卫异常: {e}", "", logfile, final=final)
     finally:
         logfile.close()
 
 
-def _fail(st, today, attempts, reason, detail, logfile, panel=None):
-    """核验失败：写状态；若已到当日最后窗口则升级告警。"""
+def _fail(st, today, attempts, reason, detail, logfile, panel=None, final=False):
+    """核验失败：写状态。final=True 表示这是当天最后一次检查 → 立即升级告警。
+
+    不再用「当前小时」判断最后窗口 —— 一天里现在有两次调用
+    （07:00 的 Windows 计划任务、07:30 的 WorkBuddy 定时任务），
+    只有 07:30 那次传 --final，早上的失败还有补救机会、不该惊动用户。
+    """
     rec = st["days"].get(today, {})
     rec.setdefault("verified", False)
     rec["last_failure"] = reason
@@ -571,12 +574,12 @@ def _fail(st, today, attempts, reason, detail, logfile, panel=None):
     lines.append(f"守卫日志: {LOG_DIR / ('guard_' + today.replace('-', '') + '.log')}")
     log("❌ " + " | ".join(lines[:4]), logfile)
 
-    is_final = datetime.now().hour >= FINAL_CHECK_HOUR
+    is_final = final
     if is_final:
         path = raise_alert(today, reason, lines)
-        log(f"⛔ 已过最后窗口（{FINAL_CHECK_HOUR}:00），当日积分确认丢失。告警: {path}", logfile)
+        log(f"⛔ 已到最后检查窗口（--final），当日积分确认丢失。告警: {path}", logfile)
     else:
-        log(f"ℹ️ 未到最后窗口，下个检查点继续重试（state.json 已记录）", logfile)
+        log(f"ℹ️ 非最后检查窗口（未加 --final），状态已记入 state.json，待后续检查重试", logfile)
     return "FAILED"
 
 
@@ -663,6 +666,9 @@ if __name__ == "__main__":
                     help="连不上时不自动拉起 WorkBuddy")
     ap.add_argument("--use-cdp", action="store_true",
                     help="接口未确认到账时，再尝试界面点击兜底（仅旧版本 WorkBuddy 有意义）")
+    ap.add_argument("--final", action="store_true",
+                    help="标记这是当天最后一次检查（失败立即升级告警）。"
+                         "早上的计划任务不加，07:30 的定时任务要加")
     ap.add_argument("--config", default=None, help="配置文件路径")
     ap.add_argument("--nickname", default=None, help="主界面左下角用户显示名（覆盖配置）")
     args = ap.parse_args()
@@ -677,7 +683,7 @@ if __name__ == "__main__":
     auto_launch = False if args.no_auto_launch else None
     try:
         rc = guard_once(cfg, force=args.force, auto_launch=auto_launch,
-                        use_cdp=args.use_cdp)
+                        use_cdp=args.use_cdp, final=args.final)
         print(f"\nRESULT: {rc}")
         sys.exit(0 if rc in ("OK", "ALREADY_VERIFIED") else 3)
     except Exception:
