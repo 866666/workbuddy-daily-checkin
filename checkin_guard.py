@@ -259,9 +259,17 @@ SKILL_SCRIPT = (Path.home() / ".workbuddy" / "skills" / "totorosir-workbuddy-sco
 API_HOME = "https://www.codebuddy.cn/"
 
 
-def api_ping(timeout=8, retries=3):
-    """探测 codebuddy.cn 连通性。本机对该域名有间歇性 TLS 干扰，先探再打。"""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def api_ping(timeout=10, retries=3):
+    """探测 codebuddy.cn 连通性。
+
+    **刻意不屏蔽代理**（实测 2026-10-12，A/B 交替各跑 6 次状态查询）：
+        走本机代理 127.0.0.1:6664 → 成功 6/6，平均 10.7s
+        直连（清空 *_proxy 变量）    → 成功 4/6，平均 24.5s
+    本机宽带到该域名的**直连 TLS 不稳定**（与 GitHub 的 SNI/TLS 干扰同源），
+    走本机代理反而更稳。技能内部用裸 urllib.request.urlopen，同样自动采用
+    环境代理 —— 这里必须与之一致，否则探测结果不能代表真实调用。
+    """
+    opener = urllib.request.build_opener()      # 沿用环境变量里的代理
     for i in range(retries):
         try:
             with opener.open(API_HOME, timeout=timeout) as r:
@@ -432,7 +440,13 @@ def read_state_via_panel(port, cfg, logfile):
     return cc.read_panel_state(ws)
 
 
-def guard_once(cfg, force=False, auto_launch=None):
+def guard_once(cfg, force=False, auto_launch=None, use_cdp=False):
+    """执行一次守卫。
+
+    use_cdp=False（默认）：只走接口路径。WorkBuddy 5.8.1 起签到面板改为滚动气泡，
+        界面路径已不可靠；接口更稳且不受改版影响。
+    use_cdp=True：接口未确认到账时，再尝试界面点击（仅对旧版本 WorkBuddy 有意义）。
+    """
     today = date.today().isoformat()
     logfile = open(LOG_DIR / f"guard_{today.replace('-', '')}.log", "a", encoding="utf-8")
     try:
@@ -462,7 +476,15 @@ def guard_once(cfg, force=False, auto_launch=None):
                 f"置信度 {api['confidence']}，来源 API）", logfile)
             return "OK"
 
-        # ===== 路径 B：CDP 兜底（界面点击，适用于接口不可用/未到账的情况）=====
+        # ===== 路径 B：CDP 兜底（默认不启用）=====
+        # 2026-10-12 起默认只走 API：5.8.1 的签到面板已改成滚动气泡，界面路径
+        # 实测既读不到状态、也点不到按钮。保留仅为 WorkBuddy 旧版本（≤5.5.x）备用。
+        if not use_cdp:
+            ev = (api or {}).get("evidence") or []
+            return _fail(st, today, attempts,
+                         "接口路径未确认到账（未启用界面兜底）",
+                         "； ".join(ev) or "接口不可用", logfile)
+        log("[CDP] 已启用界面兜底路径", logfile)
         ok, port, msg = check_environment(cfg, logfile)
         if not ok:
             return _fail(st, today, attempts, "环境不可用", msg, logfile)
@@ -638,7 +660,9 @@ if __name__ == "__main__":
     ap.add_argument("--status", action="store_true", help="只读状态，不做任何操作")
     ap.add_argument("--force", action="store_true", help="忽略「今日已确认」，强制重新核验")
     ap.add_argument("--no-auto-launch", action="store_true", dest="no_auto_launch",
-                    help="连不上调试服务时不自动拉起 WorkBuddy")
+                    help="连不上时不自动拉起 WorkBuddy")
+    ap.add_argument("--use-cdp", action="store_true",
+                    help="接口未确认到账时，再尝试界面点击兜底（仅旧版本 WorkBuddy 有意义）")
     ap.add_argument("--config", default=None, help="配置文件路径")
     ap.add_argument("--nickname", default=None, help="主界面左下角用户显示名（覆盖配置）")
     args = ap.parse_args()
@@ -652,7 +676,8 @@ if __name__ == "__main__":
 
     auto_launch = False if args.no_auto_launch else None
     try:
-        rc = guard_once(cfg, force=args.force, auto_launch=auto_launch)
+        rc = guard_once(cfg, force=args.force, auto_launch=auto_launch,
+                        use_cdp=args.use_cdp)
         print(f"\nRESULT: {rc}")
         sys.exit(0 if rc in ("OK", "ALREADY_VERIFIED") else 3)
     except Exception:
