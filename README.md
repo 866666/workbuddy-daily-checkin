@@ -110,6 +110,8 @@ python register_windows_task.py --at 07:00
 - 优先走 pywin32 COM 注册，支持**电池供电运行**和**错过触发后开机补跑**（`StartWhenAvailable`）
 - 未装 pywin32 自动退回 `schtasks`（仅基础每日触发）
 - 通过 `pythonw.exe` 静默运行，无控制台窗口
+- **就绪等待**：启动时若网络/代理/登录态还没起来（唤醒后常见），会在同一任务内按
+  2/3/5/5/7 分钟递增间隔重试，最多等 22 分钟；环境一就绪立即签完，不会"试一次就放弃"
 - 删除任务：`python register_windows_task.py --delete`
 
 > 笔记本用户注意：若电脑在触发时间处于睡眠/关机，`StartWhenAvailable` 会让任务在
@@ -125,7 +127,19 @@ python checkin_guard.py            :: 执行一次守卫（建议在主签到后
 python checkin_guard.py --status   :: 只读状态：今天是否到账、历史几天、实时面板
 python checkin_guard.py --force    :: 忽略「今日已确认」，强制重新核验
 python checkin_guard.py --use-cdp  :: 接口未到账时，再尝试界面点击（仅旧版 WorkBuddy）
+python checkin_guard.py --wait-minutes 22 :: 首次未到账时在本任务内等待重试的窗口
 ```
+
+**就绪等待（默认开启）**
+
+计划任务在电脑刚从睡眠唤醒时触发，网络/代理/客户端登录态往往还没就绪 —— 表现为
+`无法取得任何可用凭据（通道 A/B/C 均不可用）` 或 `www.codebuddy.cn 不可达`。
+这类失败重试就能好，所以默认不立即放弃：首次失败后按 2/3/5/5/7 分钟递增间隔重试，
+最多 22 分钟（07:00 + 22 分 = 07:22，给 07:30 的第二层留余量）。
+
+- `--final`（当天最后一次检查）与 `--force`（收尾核验）不等待，失败直接出结论
+- 传 `--wait-minutes 0` 可关闭，适合手动调试时立刻退出
+- 未到账即重试；签到接口幂等，重复调用不会重复发放。一旦确认到账立即退出，不空转
 
 **两条领取路径**
 

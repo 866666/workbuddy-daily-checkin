@@ -53,6 +53,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import time
@@ -70,6 +71,14 @@ LOG_DIR = HERE / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 STATE_PATH = HERE / "state.json"
 STATE_KEEP_DAYS = 120          # state.json 只保留最近 N 天，避免无限膨胀
+
+# 07:00 主签到的「就绪等待」窗口。2026-10-13~10-20 连续 8 天 07:00 首次尝试失败
+# （通道 A/B/C 全不可用，或 www.codebuddy.cn 探测不通），而 07:30 首试即成功 ——
+# 根因是电脑 06:33 左右从睡眠唤醒后，网络/代理/客户端登录态要到 07:00 之后才就绪，
+# 脚本却是「试一次就退出」，把机会全让给了 07:30 的第二层。改为在同一个任务内
+# 按递增间隔重试，环境一就绪就立刻签完，07:30 退回纯兜底角色。
+DEFAULT_WAIT_MINUTES = 22                     # 07:00 + 22 分 = 07:22，给 07:30 留余量
+RETRY_GAPS_MIN = (2, 3, 5, 5, 7)              # 逐次等待间隔（分钟），累计 22
 
 
 def _load_cc():
@@ -281,9 +290,15 @@ def api_ping(timeout=10, retries=3):
 def run_skill(extra_args, timeout=120):
     """调用技能脚本，返回 (returncode, stdout, stderr)。脚本不会打印 token。"""
     cmd = [sys.executable, str(SKILL_SCRIPT), "--no-push"] + list(extra_args)
+    # 子进程默认按系统 ANSI 代码页输出（中文 Windows = GBK），父进程按 UTF-8 解码
+    # 会得到一串乱码 —— 2026-10-19 定位根因时就被这个坑过。强制子进程输出 UTF-8。
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+                           encoding="utf-8", errors="replace", timeout=timeout,
+                           env=env)
         return r.returncode, r.stdout or "", r.stderr or ""
     except subprocess.TimeoutExpired:
         return -1, "", "技能脚本超时"
@@ -315,8 +330,11 @@ def try_api_checkin(baseline, logfile):
         log(f"[API] 未找到技能脚本，跳过：{SKILL_SCRIPT}", logfile)
         return None
     if not api_ping():
-        log("[API] www.codebuddy.cn 不可达（本机对该域名有间歇 TLS 干扰），跳过", logfile)
-        return None
+        # 探测失败只作提示、不再直接放弃：电脑从睡眠唤醒后，网络/代理往往滞后于
+        # 计划任务启动；而通道 A（本机登录态）本身不需要外网，探测失败不代表签到
+        # 一定做不了。2026-10-20 07:00 就是被这句「不可达 → 跳过」误杀，连技能都
+        # 没调。改成交给技能自己判定，真做不了再返回 None。
+        log("[API] 连通性探测未通过（网络/代理可能未就绪），仍尝试调用技能...", logfile)
 
     log("[API] 调用接口签到（幂等，不依赖界面）...", logfile)
     data, degraded, err = None, False, ""
@@ -579,8 +597,22 @@ def _fail(st, today, attempts, reason, detail, logfile, panel=None, final=False)
         path = raise_alert(today, reason, lines)
         log(f"⛔ 已到最后检查窗口（--final），当日积分确认丢失。告警: {path}", logfile)
     else:
-        log(f"ℹ️ 非最后检查窗口（未加 --final），状态已记入 state.json，待后续检查重试", logfile)
+        log("ℹ️ 非最后检查窗口（未加 --final），状态已记入 state.json；"
+            "若本任务内还有等待窗口，会自动重试", logfile)
     return "FAILED"
+
+
+def log_wait(nap_sec, remain_sec):
+    """把「环境未就绪、多久后再试」写进当天日志（与 guard_once 共用同一个文件）。"""
+    today = date.today().isoformat()
+    try:
+        with open(LOG_DIR / f"guard_{today.replace('-', '')}.log", "a",
+                  encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ⏳ 尚未到账 → "
+                    f"{nap_sec // 60} 分 {nap_sec % 60:02d} 秒后重试"
+                    f"（本任务剩余等待约 {max(0, int(round(remain_sec / 60)))} 分钟）\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +703,9 @@ if __name__ == "__main__":
                          "早上的计划任务不加，07:30 的定时任务要加")
     ap.add_argument("--config", default=None, help="配置文件路径")
     ap.add_argument("--nickname", default=None, help="主界面左下角用户显示名（覆盖配置）")
+    ap.add_argument("--wait-minutes", type=int, default=None, dest="wait_minutes",
+                    help=f"首次未到账时在同一任务内等待/重试的窗口（分钟）。"
+                         f"默认：--final 时为 0，否则 {DEFAULT_WAIT_MINUTES}；传 0 关闭")
     args = ap.parse_args()
 
     cfg = cc.load_config(args.config)
@@ -681,9 +716,30 @@ if __name__ == "__main__":
         sys.exit(cmd_status(cfg))
 
     auto_launch = False if args.no_auto_launch else None
+    # --final 是当天最后一次检查，等也没意义；其余场景默认给一个就绪等待窗口。
+    wait_min = args.wait_minutes
+    if wait_min is None:
+        wait_min = 0 if args.final else DEFAULT_WAIT_MINUTES
+
     try:
-        rc = guard_once(cfg, force=args.force, auto_launch=auto_launch,
-                        use_cdp=args.use_cdp, final=args.final)
+        rc = "FAILED"
+        deadline = time.monotonic() + max(0, wait_min) * 60
+        max_tries = len(RETRY_GAPS_MIN) + 1
+        for i in range(max_tries):
+            rc = guard_once(cfg, force=args.force, auto_launch=auto_launch,
+                            use_cdp=args.use_cdp, final=args.final)
+            if rc in ("OK", "ALREADY_VERIFIED"):
+                break
+            # --force/--final 是收尾核验，不该再拖时间；最后一轮也直接收工
+            if args.final or args.force or i == max_tries - 1:
+                break
+            remain = deadline - time.monotonic()
+            if remain < 45:
+                break
+            nap = int(min(RETRY_GAPS_MIN[min(i, len(RETRY_GAPS_MIN) - 1)] * 60, remain))
+            log_wait(nap, remain - nap)
+            time.sleep(nap)
+
         print(f"\nRESULT: {rc}")
         sys.exit(0 if rc in ("OK", "ALREADY_VERIFIED") else 3)
     except Exception:
