@@ -77,8 +77,16 @@ STATE_KEEP_DAYS = 120          # state.json 只保留最近 N 天，避免无限
 # 根因是电脑 06:33 左右从睡眠唤醒后，网络/代理/客户端登录态要到 07:00 之后才就绪，
 # 脚本却是「试一次就退出」，把机会全让给了 07:30 的第二层。改为在同一个任务内
 # 按递增间隔重试，环境一就绪就立刻签完，07:30 退回纯兜底角色。
-DEFAULT_WAIT_MINUTES = 22                     # 07:00 + 22 分 = 07:22，给 07:30 留余量
-RETRY_GAPS_MIN = (2, 3, 5, 5, 7)              # 逐次等待间隔（分钟），累计 22
+#
+# 2026-10-21 再修正：窗口 22 分钟（到 07:22）**不够**。当天 6 次尝试全部报
+# 「无法取得可用凭据（通道 A/B/C 均不可用）」，07:30 一次即成。取证：
+#   `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
+#   的 mtime 恰为 07:30:36（新 WorkBuddy 进程 07:30:32 启动后重写），之后通道 A 立即可用。
+# 即 5.6.2+ 的 accessToken 信封密钥只随客户端进程存活，客户端写回登录态前，
+# 磁盘上的旧信封解不开 → 通道 A 不可用。**决定性事件发生在 07:30 前后**，
+# 因此窗口必须跨过 07:30，而不是停在 07:22。
+DEFAULT_WAIT_MINUTES = 40                     # 07:00 + 40 分 = 07:40，跨过客户端写回登录态的时刻
+RETRY_GAPS_MIN = (2, 3, 5, 5, 7, 8, 8)        # 逐次等待间隔（分钟），累计 38；第 7 次落在 07:30
 
 
 def _load_cc():
@@ -320,12 +328,31 @@ def _is_network_error(msg):
         "target closed", "incomplete read"))
 
 
+def _is_credential_error(msg):
+    """判断报错是否属于「本机登录态未就绪」类（凭据侧，不是网络侧）。
+
+    典型报文：`无法取得可用凭据：无法取得任何可用凭据（通道 A/B/C 均不可用）`。
+    成因多为 5.6.2+ 的 accessToken 信封密钥只随客户端进程存活，客户端尚未写回
+    登录态文件时旧信封解不开。**这类错误不要当网络故障处理，也绝不去动凭据**——
+    客户端写回登录态（通常紧随客户端进程启动）后即可自动恢复。
+    """
+    m = (msg or "").lower()
+    return any(k in m for k in (
+        "凭据", "登录态", "accesstoken", "通道 a/b/c", "credential", "unauthorized"))
+
+
+# 最近一次接口调用的失败定性，供 _fail 的「判定依据」使用（避免只写"接口不可用"）
+_LAST_API_NOTE = ""
+
+
 def try_api_checkin(baseline, logfile):
     """接口方式签到 + 核验。
 
     返回 dict（verdict/confidence/evidence/flags/credits/action）或
     None —— 表示本路径不可用，应交给 CDP 兜底。
     """
+    global _LAST_API_NOTE
+    _LAST_API_NOTE = ""
     if not SKILL_SCRIPT.exists():
         log(f"[API] 未找到技能脚本，跳过：{SKILL_SCRIPT}", logfile)
         return None
@@ -357,11 +384,20 @@ def try_api_checkin(baseline, logfile):
     if data is None:
         # 技能在「签到后状态查询」失败时不输出 JSON；再单独查一次状态，用累计计数判定
         log(f"[API] 签到未返回 JSON（rc={rc}）：{(err or '').strip()[:120]}", logfile)
+        cred = _is_credential_error(err) or _is_credential_error(msg)
+        if cred:
+            log("[凭据] 本机登录态（通道 A）暂不可用：客户端尚未写回登录态文件，"
+                "旧信封解不开。属客户端进程侧问题，**不是网络故障、不要动凭据**，"
+                "等客户端写回（通常紧随其进程启动）即自动恢复。", logfile)
         rc2, out2, err2 = run_skill(["--json"])
         try:
             data = json.loads(out2)
         except Exception:
             log(f"[API] 状态查询同样失败 → 交给 CDP 兜底：{(err2 or '').strip()[:100]}", logfile)
+            _LAST_API_NOTE = (
+                "凭据未就绪：本机登录态（通道 A/B/C）不可用，等客户端写回登录态"
+                if (cred or _is_credential_error(err2))
+                else "外网/代理链路不通：" + ((err or err2 or "").strip()[:80] or "无输出"))
             return None
         degraded = True
 
@@ -498,7 +534,7 @@ def guard_once(cfg, force=False, auto_launch=None, use_cdp=False, final=False):
             ev = (api or {}).get("evidence") or []
             return _fail(st, today, attempts,
                          "接口路径未确认到账（未启用界面兜底）",
-                         "； ".join(ev) or "接口不可用", logfile, final=final)
+                         "； ".join(ev) or _LAST_API_NOTE or "接口不可用", logfile, final=final)
         log("[CDP] 已启用界面兜底路径", logfile)
         ok, port, msg = check_environment(cfg, logfile)
         if not ok:
