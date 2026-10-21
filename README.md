@@ -14,20 +14,28 @@
 现在改为调 WorkBuddy 自己的接口，好处是：
 
 - 不受界面改版影响
-- **WorkBuddy 不需要带 `--remote-debugging-port` 启动**
-- **WorkBuddy 进程不在线也能签到**（只读本机登录态文件，登录过一次即可）
+- **WorkBuddy 不需要带 `--remote-debugging-port` 启动**（普通方式启动即可）
 - 判定更硬：接口回报 + 单调计数器双证据
+
+> ⚠️ **但仍需要 WorkBuddy 客户端进程在运行**：5.6.2+ 的 `accessToken` 是 AES 信封，
+> 解封密钥只随客户端进程存活。进程不在时，磁盘上的旧信封解不开，三个授权通道全部失效
+> —— 报错是「无法取得任何可用凭据」，属**凭据未就绪，不是网络故障**。
 
 ## 工作方式
 
 ```
-07:00  Windows 计划任务  →  checkin_guard.py          →  接口签到（失败只记状态）
+07:00  Windows 计划任务  →  checkin_guard.py          →  接口签到（含就绪等待）
 07:30  WorkBuddy 定时任务 →  checkin_guard.py --final  →  核验/修复 + 领旅行积分
 ```
 
-- **07:00** 跑在操作系统层，**不依赖 WorkBuddy 是否在运行**
-- **07:30** 由 WorkBuddy 的定时任务调度；`--final` 表示这是当天最后一次检查，
-  失败会立即升级告警（07:00 那次失败还有补救机会，不该惊动你）
+- **07:00** 跑在操作系统层（不依赖 WorkBuddy 的定时任务机制），但需要客户端进程在运行
+- **07:00 那次会"等"**：唤醒后网络/代理/登录态往往还没就绪，脚本在同一任务内按
+  **2 → 3 → 5 → 5 → 7 → 8 → 8 分钟**递增重试（间隔累计 38 分钟，窗口上限 40 分钟，
+  最后一次尝试约在 07:38）。
+  **窗口必须跨过 07:30** —— 实测客户端在 07:30:32 启动、07:30:36 重写登录态文件，
+  等待窗口若停在 07:22 就注定白等。用 `--wait-minutes` 可调整，传 `0` 关闭
+- **07:30** 由 WorkBuddy 的定时任务调度；`--final` 表示当天最后一次检查，**不等待**、
+  失败立即升级告警（07:00 那次失败还有补救机会，不该惊动你）
 - 两处都是**幂等**的：当天已确认到账就毫秒级退出
 
 ## 怎么判断"真的到账了"
@@ -69,10 +77,11 @@ python checkin_guard.py --force
 ## 命令行
 
 ```bat
-python checkin_guard.py            :: 执行一次（幂等；已到账则秒退）
+python checkin_guard.py            :: 执行一次（幂等；已到账则秒退；默认含就绪等待）
 python checkin_guard.py --status   :: 只读状态：今天是否到账、最近几天、实时面板
-python checkin_guard.py --force    :: 忽略「今日已确认」，强制重新核验
-python checkin_guard.py --final    :: 标记为当天最后一次检查，失败立即告警
+python checkin_guard.py --force    :: 忽略「今日已确认」，强制重新核验（不等待）
+python checkin_guard.py --final    :: 当天最后一次检查，失败立即告警（不等待）
+python checkin_guard.py --wait-minutes 40   :: 就绪等待窗口（分钟），传 0 关闭
 python register_windows_task.py --at 07:00 --script checkin_guard.py
 python register_windows_task.py --delete          :: 删除任务
 ```
@@ -108,6 +117,7 @@ logs/                      日志与告警（运行时生成，不入库）
 | 现象 | 处理 |
 |---|---|
 | `RESULT: OK` / `ALREADY_VERIFIED` | 正常，当天已到账 |
+| 报「无法取得任何可用凭据（通道 A/B/C 均不可用）」 | **凭据未就绪，不是网络故障**。多见于 07:30 之前或电脑刚唤醒。脚本会自动等到 07:38；若持续出现，确认 WorkBuddy 客户端是否在运行。**不要动登录凭据** |
 | `RESULT: FAILED` + 网络类报错 | 外网/代理抖动。先探连通性（走代理），恢复后重跑；**不要动登录凭据** |
 | 报「登录态失效」/ `403` | 打开 WorkBuddy 重新登录一次 |
 | 技能报接口 404 / 字段缺失 | 官方接口变更，需更新 `skill/`（见 `skill/NOTICE.md`） |
