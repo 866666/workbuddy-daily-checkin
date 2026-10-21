@@ -1,6 +1,9 @@
-# HTTP 探测/CDP 列表接口统一用标准库 urllib 实现（见 checkin_cdp.py 的 http_get），
-# 不再依赖第三方 requests——requests 曾在 WorkBuddy 升级清理时被破坏成命名空间包，
-# 静默导致脚本误报「端口无调试服务」。
-websocket-client>=1.6
-psutil>=5.9
+# 签到链路本身**零第三方依赖**（全部标准库）。
+#
+# 只有「注册 Windows 计划任务」需要 pywin32：
+#   python register_windows_task.py --at 07:00 --script checkin_guard.py
+# 未安装时会退回 schtasks.exe（仅基础每日触发，不支持补跑）。
+#
+# 历史说明：早期版本走 CDP 点界面按钮，需要 websocket-client / psutil；
+# WorkBuddy 5.8.1 起界面路径已失效，签到改为调接口，这两个依赖已移除。
 pywin32>=306; sys_platform == "win32"

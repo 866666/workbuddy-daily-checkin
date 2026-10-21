@@ -3,6 +3,8 @@ logs/
 __pycache__/
 *.pyc
 *.pyo
+skill/scripts/__pycache__/
+skill/scripts/.toast_payload.json
 
 # 个人配置（含账号显示名，勿入库）
 config.json

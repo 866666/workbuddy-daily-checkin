@@ -54,6 +54,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -97,7 +98,57 @@ def _load_cc():
     return mod
 
 
-cc = _load_cc()
+class _LazyCC:
+    """延迟加载 checkin_cdp.py —— **只有走界面路径时才需要它**。
+
+    接口签到（默认主路径）完全不依赖 CDP，因此 checkin_cdp.py 可以不存在。
+    用属性代理保持 `cc.xxx` 的调用写法不变；真正访问时才导入，
+    文件缺失时抛出明确错误而不是在导入阶段就整体崩溃。
+    """
+
+    _mod = None
+    _failed = False
+
+    def _load(self):
+        if _LazyCC._mod is None and not _LazyCC._failed:
+            path = HERE / "checkin_cdp.py"
+            if not path.exists():
+                _LazyCC._failed = True
+            else:
+                try:
+                    _LazyCC._mod = _load_cc()
+                except Exception as e:
+                    _LazyCC._failed = True
+                    print(f"[warn] checkin_cdp.py 加载失败（界面路径不可用）: {e}")
+        if _LazyCC._mod is None:
+            raise RuntimeError(
+                "checkin_cdp.py 不存在或加载失败，界面路径不可用；"
+                "接口签到不受影响（去掉 --use-cdp 即可）")
+        return _LazyCC._mod
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+cc = _LazyCC()
+
+# 已领取状态文案（接口/界面两条路径共用，故在此内联，不依赖 checkin_cdp）
+CLAIMED_RE = re.compile(r"今日已领|已领取|已签到|今日已|已打卡|已领")
+
+
+def load_config(path=None):
+    """读取 config.json（仅界面路径/昵称等可选设置用；接口签到不需要任何配置）"""
+    here = Path(__file__).resolve().parent
+    candidates = [Path(path)] if path else [here / "config.json"]
+    cfg = {"debug_port": 9222, "nickname": "", "claim_text": "立即领取",
+           "skip_ports": [], "workbuddy_exe": "auto", "auto_launch": False}
+    for p in candidates:
+        if p.exists():
+            try:
+                cfg.update(json.loads(p.read_text(encoding="utf-8")))
+            except Exception as e:
+                print(f"[warn] 读取配置 {p} 失败: {e}")
+    return cfg
 
 
 def log(msg, logfile=None):
@@ -162,7 +213,7 @@ def judge(panel, baseline):
 
     btn_text = (panel.get("btnText") or "").strip()
     btn_disabled = panel.get("btnDisabled")
-    btn_claimed = (btn_disabled is True) and bool(cc.CLAIMED_RE.search(btn_text))
+    btn_claimed = (btn_disabled is True) and bool(CLAIMED_RE.search(btn_text))
     if btn_claimed:
         ev.append(f"按钮「{btn_text}」且 disabled=true")
 
@@ -682,8 +733,12 @@ def cmd_status(cfg):
         print(f"    {mark} {d}  {r.get('total_points')} 分  "
               f"置信度={r.get('confidence')}  检查{r.get('attempts')}次")
 
-    # 实时读一次页面（只读，不点击领取）
+    # 实时读一次页面（只读，不点击领取）。仅当本副本包含 checkin_cdp.py 时才可用。
     print("\n  实时面板（只读）:")
+    if not (HERE / "checkin_cdp.py").exists():
+        print("    （未包含 checkin_cdp.py，跳过界面探测；接口签到不受影响）")
+        print("=" * 62)
+        return 0
     try:
         port = cc.detect_debug_port(cfg)
         if not cc.cdp_is_workbuddy(port):
@@ -744,7 +799,7 @@ if __name__ == "__main__":
                          f"默认：--final 时为 0，否则 {DEFAULT_WAIT_MINUTES}；传 0 关闭")
     args = ap.parse_args()
 
-    cfg = cc.load_config(args.config)
+    cfg = load_config(args.config)
     if args.nickname is not None:
         cfg["nickname"] = args.nickname
 

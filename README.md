@@ -1,227 +1,137 @@
 # workbuddy-daily-checkin
 
-通过 **CDP（Chrome DevTools Protocol）** 自动完成 WorkBuddy 每日签到领积分的小工具。
+自动领取 WorkBuddy「Buddy 加油站」每日积分的小工具 —— **走接口，不依赖界面**。
 
-> WorkBuddy 基于 Electron/Chromium。只要它以 `--remote-debugging-port=9222` 启动，
-> 脚本就能通过本机调试端口在页面里找到签到按钮替你点掉——全程只连 `127.0.0.1`，
-> 不把任何数据发给第三方。
+> 每天签到 100 分 + 派猫猫旅行 5-10 分，按日发放、**不补发**。
+> 本工具在 07:00 领一次、07:30 再核验一次，没到账就自动修复重试。
 
-## ✨ 快速开始（推荐）
+## 为什么不用界面点击了
 
-只需运行一次配置向导，之后完全不用管：
+早期版本通过 CDP（Chrome DevTools Protocol）驱动 WorkBuddy 界面点「立即领取」。
+**WorkBuddy 5.8.1 起，签到面板改成了轮播气泡**，`section.fuel-card` 等固定 DOM 全部消失，
+按钮既读不到状态、也点不到 —— 实测已完全失效（按钮找不到、状态识别失效、面板打不开）。
 
-```bat
-pip install -r requirements.txt
-python checkin_cdp.py --setup
+现在改为调 WorkBuddy 自己的接口，好处是：
+
+- 不受界面改版影响
+- **WorkBuddy 不需要带 `--remote-debugging-port` 启动**
+- **WorkBuddy 进程不在线也能签到**（只读本机登录态文件，登录过一次即可）
+- 判定更硬：接口回报 + 单调计数器双证据
+
+## 工作方式
+
+```
+07:00  Windows 计划任务  →  checkin_guard.py          →  接口签到（失败只记状态）
+07:30  WorkBuddy 定时任务 →  checkin_guard.py --final  →  核验/修复 + 领旅行积分
 ```
 
-向导会依次自动完成：
+- **07:00** 跑在操作系统层，**不依赖 WorkBuddy 是否在运行**
+- **07:30** 由 WorkBuddy 的定时任务调度；`--final` 表示这是当天最后一次检查，
+  失败会立即升级告警（07:00 那次失败还有补救机会，不该惊动你）
+- 两处都是**幂等**的：当天已确认到账就毫秒级退出
 
-1. **启动 WorkBuddy** —— 自动定位安装位置，以调试端口模式拉起；若 WorkBuddy 已在运行但未带
-   调试端口，会询问后自动重启（调试参数只在启动时生效）
-2. **登录引导** —— 未登录时提示你在弹出的 WorkBuddy 窗口完成扫码/登录，脚本检测到登录后自动继续
-3. **自动生成配置** —— 从页面自动提取你的昵称写入 `config.json`，无需手填；自动校验签到按钮文案
-4. **注册每日计划任务** —— 确认后注册两个任务：主签到（默认每天 07:00 静默签到，
-   **错过触发会自动补跑**，支持电池供电）+ 签到守卫（主签到之后核验并自动修复，见下文）
+## 怎么判断"真的到账了"
 
-跑完这 5 步，每天自动签到。**默认不自动拉起/重启 WorkBuddy**——适合 WorkBuddy 常驻运行
-的场景；若需要"发现没开就自动拉起"，把 `config.json` 的 `auto_launch` 设为 `true` 即可。
+不靠界面文案猜，用两条独立证据：
 
-手动补签 / 自检：`python checkin_cdp.py`（今日已领时自动识别并正常退出）。
-连不上调试服务时禁用自动拉起：`python checkin_cdp.py --no-auto-launch`。
+| 证据 | 内容 |
+|---|---|
+| 接口回报 | `daily-checkin` 返回「今日已签到 / 签到成功」（当日已签会返回 `code 10001`，属正常） |
+| 计数增长 | 本期「累计领取积分」比历史基线增长（单调计数器，说明当天确实入账） |
 
-## 特性
+两条都成立 → 置信度 `high`；只有计数增长 → `medium`；都没有 → 未到账，触发领取。
 
-- 🖱 自动查找并点击签到按钮（穿透 shadow DOM），点击后自动校验是否生效；今日已领自动识别
-- 🚀 **可选自动拉起**：默认关闭（适合 WorkBuddy 常驻场景）；`config.json` 的 `auto_launch: true`
-  可开启"没运行就自动启动（带调试端口）"
-- 🔌 端口自适应：固定端口被占时自动扫描本机 CDP 端口（仅接受目标应用）
-- 🌙 跨午夜自动刷新页面，避免界面仍显示"昨日已领"
-- ⚙️ 按钮文案 / 昵称 / 跳过端口全部可配置，应用改版时改 `config.json` 即可
-- 📋 日志落盘 `logs/checkin_YYYYMMDD.log`，静默运行异常也会写 crash 日志
-- 🗓 内置 Windows 计划任务注册，每日无人值守自动签到
-- 🔍 **签到守卫**（`checkin_guard.py`）：主签到之后再核验一次，用「按钮状态 + 累计积分计数器」
-  双证据确认当天真的到账；没到账就自动排查、修复、重试。签到失败不再静默丢失
+> 期数切换（如第 10 期 → 第 11 期）会让计数器归零，此时自动识别为 `period_reset`，
+> **弃用计数证据、只认接口回报**，不会误判成丢分。
 
 ## 环境要求
 
 - Windows 10/11
-- Python 3.9+（唯一必需依赖是 `websocket-client`；HTTP 探测/CDP 列表用标准库实现，
-  不依赖 `requests`。自动拉起/进程管理建议安装 `psutil`、计划任务完整功能建议安装
-  `pywin32`——缺省时均有降级路径）
-- 已安装 WorkBuddy 桌面版
+- Python 3.9+
+- **无第三方依赖**（全部标准库）；只有「注册计划任务」需要 `pywin32`
 
-## 手动配置（可选）
+  ```
+  pip install pywin32
+  ```
 
-`--setup` 会自动生成 `config.json`；如需手动调整，可复制模板：
+- 已登录过 WorkBuddy 桌面版（登录态文件需存在）
+
+## 快速开始
 
 ```bat
-copy config.example.json config.json
+:: 1. 注册每天 07:00 的签到任务（pywin32，支持电池供电 + 错过补跑）
+python register_windows_task.py --at 07:00 --script checkin_guard.py
+
+:: 2. 手动验证一次
+python checkin_guard.py --force
 ```
-
-| 字段 | 说明 | 默认 |
-|---|---|---|
-| `debug_port` | 目标应用 CDP 调试端口 | `9222` |
-| `claim_text` | 签到按钮文案（应用改版后改这里） | `立即领取` |
-| `nickname` | 主界面左下角用户显示名；留空则跳过"点头像打开面板"的兜底步骤 | `""` |
-| `skip_ports` | 自动扫描端口时要跳过的端口（本机有其他调试服务时） | `[]` |
-| `workbuddy_exe` | WorkBuddy 可执行文件路径；`auto` 为自动定位 | `"auto"` |
-| `auto_launch` | 连不上调试服务时是否自动拉起/重启 WorkBuddy（常驻场景建议 `false`） | `false` |
-
-配置优先级：内置默认 < 同目录 `config.json` < `--config` 指定文件 < 命令行参数。
-`config.json` 已在 `.gitignore` 中，含个人昵称也不会误提交。
 
 ## 命令行
 
 ```bat
-python checkin_cdp.py --setup            :: 一键配置向导（首次）
-python checkin_cdp.py                    :: 正常签到（默认不拉起；auto_launch=true 时连不上会自动拉起）
-python checkin_cdp.py --dry              :: 只检测按钮，不点击
-python checkin_cdp.py --info             :: 打印端口与页面列表（先自检用这个）
-python checkin_cdp.py --no-auto-launch   :: 强制禁用自动拉起，连不上直接报错
-python checkin_cdp.py --nickname 我的名字
-python checkin_cdp.py --claim-text 签到有礼
-```
-
-### 让 WorkBuddy 带调试端口启动（若不用 --setup 的手动方式）
-
-方法 A —— 修改快捷方式参数：右键 WorkBuddy 快捷方式 → 属性 → 目标末尾追加：
-
-```
-"C:\...\WorkBuddy.exe" --remote-debugging-port=9222
-```
-
-方法 B —— 用启动器（免改快捷方式，无窗口启动）。新建 `start_hidden.vbs`（保持纯 ASCII 保存）：
-
-```vbs
-Set ws = CreateObject("WScript.Shell")
-ws.Run """C:\Program Files\WorkBuddy\WorkBuddy.exe"" --remote-debugging-port=9222", 0, False
-```
-
-之后用这个 vbs 启动 WorkBuddy。**注意：调试参数只在启动时生效，普通方式重启后端口会消失。**
-（`--setup` / 自动拉起已内置此逻辑，手动方式仅在你想自己控制启动时使用。）
-
-## 每日自动运行（Windows 计划任务）
-
-```bat
-python register_windows_task.py --at 07:00
-```
-
-- 优先走 pywin32 COM 注册，支持**电池供电运行**和**错过触发后开机补跑**（`StartWhenAvailable`）
-- 未装 pywin32 自动退回 `schtasks`（仅基础每日触发）
-- 通过 `pythonw.exe` 静默运行，无控制台窗口
-- **就绪等待**：启动时若网络/代理/登录态还没起来（唤醒后常见），会在同一任务内按
-  2/3/5/5/7/8/8 分钟递增间隔重试，最多等 38 分钟（跨过 07:30 客户端写回登录态的时刻）；
-  环境一就绪立即签完，不会"试一次就放弃"
-- 删除任务：`python register_windows_task.py --delete`
-
-> 笔记本用户注意：若电脑在触发时间处于睡眠/关机，`StartWhenAvailable` 会让任务在
-> 下次开机时自动补跑（需 pywin32 注册方式）。普通 `schtasks` 错过了就错过了。
-
-## 🔍 签到守卫：确保当天积分不漏领
-
-主签到每天只出手一次，**一旦这次失败，当天积分就白丢**（积分按日发放、不补发）。
-`checkin_guard.py` 负责在主签到之后再核验一次，未到账则自动修复重取。
-
-```bat
-python checkin_guard.py            :: 执行一次守卫（建议在主签到后 30 分钟）
-python checkin_guard.py --status   :: 只读状态：今天是否到账、历史几天、实时面板
+python checkin_guard.py            :: 执行一次（幂等；已到账则秒退）
+python checkin_guard.py --status   :: 只读状态：今天是否到账、最近几天、实时面板
 python checkin_guard.py --force    :: 忽略「今日已确认」，强制重新核验
-python checkin_guard.py --use-cdp  :: 接口未到账时，再尝试界面点击（仅旧版 WorkBuddy）
-python checkin_guard.py --wait-minutes 40 :: 首次未到账时在本任务内等待重试的窗口
+python checkin_guard.py --final    :: 标记为当天最后一次检查，失败立即告警
+python register_windows_task.py --at 07:00 --script checkin_guard.py
+python register_windows_task.py --delete          :: 删除任务
 ```
 
-**就绪等待（默认开启）**
+## 目录结构
 
-计划任务在电脑刚从睡眠唤醒时触发，网络/代理/客户端登录态往往还没就绪 —— 表现为
-`无法取得任何可用凭据（通道 A/B/C 均不可用）` 或 `www.codebuddy.cn 不可达`。
-这类失败重试就能好，所以默认不立即放弃：首次失败后按 2/3/5/5/7/8/8 分钟递增间隔重试，
-最多 38 分钟（07:00 + 38 分 ≈ 07:38）。
+```
+checkin_guard.py           签到 + 核验 + 告警（唯一主脚本）
+register_windows_task.py   注册 Windows 计划任务
+push_github.py             本仓库的推送工具（Git Data API，仅开发用）
+skill/                     第三方技能「WorkBuddy积分助手」（MIT-0，见 skill/NOTICE.md）
+state.json                 每日核验记录与基线（运行时生成，不入库）
+logs/                      日志与告警（运行时生成，不入库）
+```
 
-> 窗口为什么必须跨过 07:30：5.6.2+ 的 `accessToken` 是 AES 信封，解封密钥只随客户端进程
-> 存在；客户端重写 `workbuddy-desktop.info` 之前，磁盘上的旧信封解不开，通道 A 必然报
-> 「无法取得任何可用凭据」。实测该文件在 07:30 前后被重写，所以等待窗口停在 07:22 无效。
-> 这类报错属**凭据未就绪**，不是网络故障 —— **不要因此去动登录凭据**。
+## 网络说明（重要，实测 2026-10-12）
 
-- `--final`（当天最后一次检查）与 `--force`（收尾核验）不等待，失败直接出结论
-- 传 `--wait-minutes 0` 可关闭，适合手动调试时立刻退出
-- 未到账即重试；签到接口幂等，重复调用不会重复发放。一旦确认到账立即退出，不空转
+本机到 `www.codebuddy.cn` 的**直连 TLS 不稳定**，但**走本机代理反而更稳**：
 
-**两条领取路径**
-
-| 路径 | 方式 | 何时用 |
+| 模式 | 成功率 | 平均耗时 |
 |---|---|---|
-| **A · API（默认）** | 调 WorkBuddy 自己的接口，幂等 | 默认。**不受 UI 改版影响** |
-| B · CDP | 点头像卡片 →「Buddy加油站」→ 点「立即领取」 | 仅 WorkBuddy **≤ 5.5.x** 有意义，需显式加 `--use-cdp` |
+| 走代理 `127.0.0.1:6664` | **6/6 (100%)** | 10.7s |
+| 直连（清空 `*_proxy`） | 4/6 (67%) | 24.5s |
 
-> 自 **5.8.1** 起，签到面板从固定 DOM 改成了**滚动气泡**，`section.fuel-card` / `.fuel-stats`
-> 已抓不到 —— 这就是默认改走接口的原因。旧版本 WorkBuddy 可用 `--use-cdp` 打开界面兜底。
+所以脚本**沿用环境变量里的代理**，请**不要**为了"绕开代理"而清空 `*_proxy`。
+另：`api.github.com` 两者无差异（各 4/4），推送工具不受影响。
 
-> **代理说明（实测，2026-10-12）**：本机到 `www.codebuddy.cn` 的**直连** TLS 不稳定，
-> 但**走本机代理反而更稳** —— A/B 交替各 6 次：走代理 6/6（平均 10.7s）、直连 4/6（平均 24.5s）。
-> 所以脚本与技能都**沿用环境变量里的代理**，请不要为了"绕开代理"而清空 `*_proxy`。
-
-**怎么判断"真的到账了"**——不靠界面文案猜，用两条独立证据：
-
-| 路径 | 证据 |
-|---|---|
-| A · API | ① 接口回报「今日已签到 / 签到成功」（权威）② 本期累计积分比基线增长 |
-| B · CDP | ① 主按钮文案「今日已领」且 `disabled=true` ② 面板「累计领取 N 分」比基线增长 |
-
-两条都成立 → 置信度 `high`；只有一条 → `medium`（记录并留待复核）；
-都没有 → 判定未到账，自动执行领取。期数切换导致计数器归零时会自动识别，
-弃用计数证据、只认状态证据并标记 `period_reset`。
-
-失败时的升级阶梯：
-
-```
-路径 A（API，默认）
-  A0 探测 codebuddy.cn 连通性（**走代理**，实测比直连稳）
-  A1 调接口签到（幂等）→ 仅网络类报错重试，最多 3 次；登录态/权限类不重试
-  A2 核验：接口回报 + 本期累计积分是否比基线增长
-  ↓ 未到账
-（可选）路径 B（CDP，仅旧版 WorkBuddy）
-  加 --use-cdp 才会走：依赖自检 → CDP 端口 → 多窗口时挑真正的主窗口
-  → 面板 → 轻量领取 → 刷新重试
-仍失败 → 写 logs/GUARD_ALERT_<日期>.txt + Windows 通知
-```
-
-每日核验结果与基线记录在 `state.json`（已在 `.gitignore`）。
-
-> 调度建议：本工具自身只提供"一次守卫"的入口，**用哪个调度器由你决定**——
-> Windows 计划任务（见上节）、WorkBuddy 自身定时任务，或任何能定时跑命令的机制都行。
-> 典型配置就是「主签到 07:00 + 守卫 07:30」。
-
-### 注册守卫计划任务（可选）
-
-```bat
-python register_windows_task.py --guard                       :: 一天多个检查点
-python register_windows_task.py --guard --times 08:00,20:00   :: 自定义检查点
-python register_windows_task.py --delete-all                  :: 删除主签到与守卫任务
-```
+脚本只对**网络类**报错重试（`HTTP 0` / `SSL` / `EOF` / `timeout` / `handshake`，
+最多 3 次）；登录态失效、`403` 等**不重试**。
 
 ## 故障排查
 
 | 现象 | 处理 |
 |---|---|
-| `RESULT: NO_CDP` | WorkBuddy 没带 `--remote-debugging-port` 启动。先跑 `--setup` 一键修复，或查 `--info` |
-| `RESULT: NO_BUTTON` | 今日已领（正常）；或应用 UI 改版导致按钮文案变化——改 `config.json` 的 `claim_text` |
-| `未找到「XX」头像元素` | `nickname` 填错，或该版本无需点头像（可留空） |
-| `RESULT: DEP_FAIL` | `websocket-client` 被清理工具破坏（包目录残留、缺 `create_connection`）。脚本会自动重装；失败时手动 `pip install --force-reinstall websocket-client` |
-| 脚本误报「端口无调试服务」 | 同上：第三方依赖损坏会被静默吞掉。现已改用标准库 + 启动依赖自检，日志里会打印「依赖自检」一行 |
-| 向导等待登录时卡住 | 确认 WorkBuddy 窗口已弹出并完成登录；超时 5 分钟可重跑 `--setup` |
-| 找不到 WorkBuddy 安装位置 | 在 `config.json` 的 `workbuddy_exe` 填完整路径 |
-| 守卫报「无法读取签到面板」 | 面板结构可能改版。用 `python archive/probe_fuel_panel.py` / `probe_fuel_panel2.py` 重新探测真实 DOM，再更新 `checkin_cdp.py` 里的选择器 |
-| 守卫报「累计积分下降 / period_reset」 | 加油站进入新一期、计数器归零，属正常；此时只认按钮状态证据 |
-| 连续多天没领到但脚本没报错 | 典型的静默失败（依赖被清理工具破坏）。跑 `python checkin_guard.py --status` 看真实状态，日志里查「依赖自检」一行 |
+| `RESULT: OK` / `ALREADY_VERIFIED` | 正常，当天已到账 |
+| `RESULT: FAILED` + 网络类报错 | 外网/代理抖动。先探连通性（走代理），恢复后重跑；**不要动登录凭据** |
+| 报「登录态失效」/ `403` | 打开 WorkBuddy 重新登录一次 |
+| 技能报接口 404 / 字段缺失 | 官方接口变更，需更新 `skill/`（见 `skill/NOTICE.md`） |
+| 连续多天没到账但脚本没报错 | 看 `logs/guard_YYYYMMDD.log` 里 `[API] 判定` 一行，再查 `state.json` |
+| 想看完整积分播报 | `python skill/scripts/buddy_station.py --no-push` |
+
+## 派猫猫旅行
+
+每天可领 5-10 分（**派遣上限约 1 次/天**，多跑无收益）。到达后奖励不会过期，
+所以每天 07:30 跑一次「领上一趟 + 派下一趟」即可：
+
+```bat
+python skill/scripts/buddy_station.py --travel-auto --no-push
+```
+
+`--no-push` 表示只领取、不向外部渠道推送播报。
 
 ## 免责声明
 
 - 本工具仅用于**自己的账号**、自己的设备，请遵守目标应用的用户协议与平台规则
-- 目标应用界面改版可能导致脚本失效，请及时更新 `claim_text` 等配置
-- 脚本通过官方 CDP 调试协议驱动本地应用，不涉及破解、注入或外挂
+- `skill/` 为第三方作品（MIT-0），版权归原作者 TOTORO（totorosir）所有
 - 使用本工具产生的一切后果由使用者自行承担
 
 ## 许可证
 
-[MIT](./LICENSE)
+本项目代码：[MIT](./LICENSE)
+收录的第三方技能：MIT-0（见 [skill/NOTICE.md](./skill/NOTICE.md)）

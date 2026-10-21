@@ -106,6 +106,7 @@ def main():
     owner, repo = args.repo.split("/")
 
     # 收集文件
+    cwd = Path.cwd().resolve()
     files = []
     seen = set()
     for p in args.paths:
@@ -113,7 +114,9 @@ def main():
         if p.is_dir():
             for f in sorted(p.rglob("*")):
                 if f.is_file():
-                    rel = f.relative_to(Path.cwd()).as_posix()
+                    # rglob 返回的可能是相对路径，必须先 resolve 再相对化；
+                    # 直接 f.relative_to(Path.cwd()) 会抛 ValueError（相对 vs 绝对）
+                    rel = f.resolve().relative_to(cwd).as_posix()
                     if rel not in seen:
                         seen.add(rel)
                         files.append((rel, f.read_bytes()))
